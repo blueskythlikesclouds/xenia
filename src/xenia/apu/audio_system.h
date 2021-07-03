@@ -65,7 +65,7 @@ class AudioSystem {
 
   // TODO(gibbed): respect XAUDIO2_MAX_QUEUED_BUFFERS somehow (ie min(64,
   // XAUDIO2_MAX_QUEUED_BUFFERS))
-  static const size_t kMaximumQueuedFrames = 64;
+  static const size_t kMaximumQueuedFrames = 16;
 
   Memory* memory_ = nullptr;
   cpu::Processor* processor_ = nullptr;

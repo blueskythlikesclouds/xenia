@@ -1,3 +1,11 @@
+# SWA Hack
+This is an **UNOFFICIAL** branch containing **GAME SPECIFIC** hacks to prevent blackouts in Sonic Unleashed.  
+You still cannot complete the game from the start to the finish. Most stages are playable with a complete save file. **This is not perfect, blackouts/crashes still can happen.**
+
+## **THIS IS AN UNOFFICIAL MODIFICATION!!! DO NOT ASK XENIA DEVELOPERS FOR TECH SUPPORT!!!**
+
+# Original README
+
 <p align="center">
     <a href="https://github.com/xenia-project/xenia/tree/master/assets/icon">
         <img height="120px" src="https://raw.githubusercontent.com/xenia-project/xenia/master/assets/icon/128.png" />
