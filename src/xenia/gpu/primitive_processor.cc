@@ -331,7 +331,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         break;
       case xenos::PrimitiveType::kQuadList:
         if (convert_quad_lists_to_triangle_lists_) {
-          host_primitive_type = xenos::PrimitiveType::kQuadList;
+          host_primitive_type = xenos::PrimitiveType::kTriangleList;
         }
         break;
       default:
@@ -510,7 +510,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         SharedMemory::kBufferSize - guest_index_base <
             guest_index_buffer_needed_bytes) {
       XELOGE(
-          "Primitive processor: Index buffer at 0x{:8X}, 0x{:X} bytes "
+          "Primitive processor: Index buffer at 0x{:08X}, 0x{:X} bytes "
           "required, is out of the physical memory bounds",
           guest_index_base, guest_index_buffer_needed_bytes);
       assert_always();
@@ -814,7 +814,7 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         if (!shared_memory_.RequestRange(guest_index_base,
                                          guest_index_buffer_needed_bytes)) {
           XELOGE(
-              "PrimitiveProcessor: Failed to request index buffer 0x{:8X}, "
+              "PrimitiveProcessor: Failed to request index buffer 0x{:08X}, "
               "0x{:X} bytes needed, in the shared memory",
               guest_index_base, guest_index_buffer_needed_bytes);
           return false;
