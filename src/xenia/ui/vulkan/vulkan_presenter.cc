@@ -60,16 +60,16 @@ namespace vulkan {
 
 // Generated with `xb buildshaders`.
 namespace shaders {
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_bilinear_dither_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_bilinear_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_cas_resample_dither_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_cas_resample_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_cas_sharpen_dither_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_cas_sharpen_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_easu_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_rcas_dither_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_rcas_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_triangle_strip_rect_vert.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_bilinear_dither_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_bilinear_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_cas_resample_dither_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_cas_resample_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_cas_sharpen_dither_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_cas_sharpen_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_easu_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_rcas_dither_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_rcas_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
 VulkanPresenter::PaintContext::Submission::~Submission() {
@@ -313,7 +313,7 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
     image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     image_memory_barrier.image = guest_output_image->image();
-    util::InitializeSubresourceRange(image_memory_barrier.subresourceRange);
+    image_memory_barrier.subresourceRange = util::InitializeSubresourceRange();
     dfn.vkCmdPipelineBarrier(command_buffer, kGuestOutputInternalStageMask,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                              nullptr, 1, &image_memory_barrier);
@@ -1543,8 +1543,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             std::make_pair(uint64_t(0), guest_output_image);
         // Create the descriptors of the new image.
         VkDescriptorImageInfo guest_output_image_descriptor_image_info;
-        guest_output_image_descriptor_image_info.sampler =
-            provider_.GetHostSampler(VulkanProvider::HostSampler::kLinearClamp);
+        guest_output_image_descriptor_image_info.sampler = VK_NULL_HANDLE;
         guest_output_image_descriptor_image_info.imageView =
             guest_output_image->view();
         guest_output_image_descriptor_image_info.imageLayout =
@@ -1561,7 +1560,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
         guest_output_image_descriptor_write.dstArrayElement = 0;
         guest_output_image_descriptor_write.descriptorCount = 1;
         guest_output_image_descriptor_write.descriptorType =
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         guest_output_image_descriptor_write.pImageInfo =
             &guest_output_image_descriptor_image_info;
         guest_output_image_descriptor_write.pBufferInfo = nullptr;
@@ -1642,9 +1641,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             }
             // Descriptors.
             VkDescriptorImageInfo intermediate_descriptor_image_info;
-            intermediate_descriptor_image_info.sampler =
-                provider_.GetHostSampler(
-                    VulkanProvider::HostSampler::kLinearClamp);
+            intermediate_descriptor_image_info.sampler = VK_NULL_HANDLE;
             intermediate_descriptor_image_info.imageView =
                 intermediate_image_ptr_ref->view();
             intermediate_descriptor_image_info.imageLayout =
@@ -1662,7 +1659,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
             intermediate_descriptor_write.dstArrayElement = 0;
             intermediate_descriptor_write.descriptorCount = 1;
             intermediate_descriptor_write.descriptorType =
-                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
             intermediate_descriptor_write.pImageInfo =
                 &intermediate_descriptor_image_info;
             intermediate_descriptor_write.pBufferInfo = nullptr;
@@ -2115,24 +2112,34 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   const VulkanProvider::DeviceFunctions& dfn = provider_.dfn();
   VkDevice device = provider_.device();
 
+  VkDescriptorSetLayoutBinding guest_output_image_sampler_bindings[2];
+  guest_output_image_sampler_bindings[0].binding = 0;
+  guest_output_image_sampler_bindings[0].descriptorType =
+      VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  guest_output_image_sampler_bindings[0].descriptorCount = 1;
+  guest_output_image_sampler_bindings[0].stageFlags =
+      VK_SHADER_STAGE_FRAGMENT_BIT;
+  guest_output_image_sampler_bindings[0].pImmutableSamplers = nullptr;
   VkSampler sampler_linear_clamp =
       provider_.GetHostSampler(VulkanProvider::HostSampler::kLinearClamp);
-  VkDescriptorSetLayoutBinding guest_output_image_binding;
-  guest_output_image_binding.binding = 0;
-  guest_output_image_binding.descriptorType =
-      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  guest_output_image_binding.descriptorCount = 1;
-  guest_output_image_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-  guest_output_image_binding.pImmutableSamplers = &sampler_linear_clamp;
+  guest_output_image_sampler_bindings[1].binding = 1;
+  guest_output_image_sampler_bindings[1].descriptorType =
+      VK_DESCRIPTOR_TYPE_SAMPLER;
+  guest_output_image_sampler_bindings[1].descriptorCount = 1;
+  guest_output_image_sampler_bindings[1].stageFlags =
+      VK_SHADER_STAGE_FRAGMENT_BIT;
+  guest_output_image_sampler_bindings[1].pImmutableSamplers =
+      &sampler_linear_clamp;
   VkDescriptorSetLayoutCreateInfo
       guest_output_paint_image_descriptor_set_layout_create_info;
   guest_output_paint_image_descriptor_set_layout_create_info.sType =
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
   guest_output_paint_image_descriptor_set_layout_create_info.pNext = nullptr;
   guest_output_paint_image_descriptor_set_layout_create_info.flags = 0;
-  guest_output_paint_image_descriptor_set_layout_create_info.bindingCount = 1;
+  guest_output_paint_image_descriptor_set_layout_create_info.bindingCount =
+      uint32_t(xe::countof(guest_output_image_sampler_bindings));
   guest_output_paint_image_descriptor_set_layout_create_info.pBindings =
-      &guest_output_image_binding;
+      guest_output_image_sampler_bindings;
   if (dfn.vkCreateDescriptorSetLayout(
           device, &guest_output_paint_image_descriptor_set_layout_create_info,
           nullptr,
@@ -2213,9 +2220,9 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   shader_module_create_info.pNext = nullptr;
   shader_module_create_info.flags = 0;
   shader_module_create_info.codeSize =
-      sizeof(shaders::guest_output_triangle_strip_rect_vert);
-  shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-      shaders::guest_output_triangle_strip_rect_vert);
+      sizeof(shaders::guest_output_triangle_strip_rect_vs);
+  shader_module_create_info.pCode =
+      shaders::guest_output_triangle_strip_rect_vs;
   if (dfn.vkCreateShaderModule(device, &shader_module_create_info, nullptr,
                                &guest_output_paint_vs_) != VK_SUCCESS) {
     XELOGE(
@@ -2229,57 +2236,54 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
     switch (guest_output_paint_effect) {
       case GuestOutputPaintEffect::kBilinear:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_bilinear_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_bilinear_frag);
+            sizeof(shaders::guest_output_bilinear_ps);
+        shader_module_create_info.pCode = shaders::guest_output_bilinear_ps;
         break;
       case GuestOutputPaintEffect::kBilinearDither:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_bilinear_dither_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_bilinear_dither_frag);
+            sizeof(shaders::guest_output_bilinear_dither_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_bilinear_dither_ps;
         break;
       case GuestOutputPaintEffect::kCasSharpen:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_ffx_cas_sharpen_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_ffx_cas_sharpen_frag);
+            sizeof(shaders::guest_output_ffx_cas_sharpen_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_ffx_cas_sharpen_ps;
         break;
       case GuestOutputPaintEffect::kCasSharpenDither:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_ffx_cas_sharpen_dither_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_ffx_cas_sharpen_dither_frag);
+            sizeof(shaders::guest_output_ffx_cas_sharpen_dither_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_ffx_cas_sharpen_dither_ps;
         break;
       case GuestOutputPaintEffect::kCasResample:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_ffx_cas_resample_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_ffx_cas_resample_frag);
+            sizeof(shaders::guest_output_ffx_cas_resample_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_ffx_cas_resample_ps;
         break;
       case GuestOutputPaintEffect::kCasResampleDither:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_ffx_cas_resample_dither_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_ffx_cas_resample_dither_frag);
+            sizeof(shaders::guest_output_ffx_cas_resample_dither_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_ffx_cas_resample_dither_ps;
         break;
       case GuestOutputPaintEffect::kFsrEasu:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_ffx_fsr_easu_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_ffx_fsr_easu_frag);
+            sizeof(shaders::guest_output_ffx_fsr_easu_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_fsr_easu_ps;
         break;
       case GuestOutputPaintEffect::kFsrRcas:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_ffx_fsr_rcas_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_ffx_fsr_rcas_frag);
+            sizeof(shaders::guest_output_ffx_fsr_rcas_ps);
+        shader_module_create_info.pCode = shaders::guest_output_ffx_fsr_rcas_ps;
         break;
       case GuestOutputPaintEffect::kFsrRcasDither:
         shader_module_create_info.codeSize =
-            sizeof(shaders::guest_output_ffx_fsr_rcas_dither_frag);
-        shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(
-            shaders::guest_output_ffx_fsr_rcas_dither_frag);
+            sizeof(shaders::guest_output_ffx_fsr_rcas_dither_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_ffx_fsr_rcas_dither_ps;
         break;
       default:
         // Not supported by this implementation.
@@ -2393,11 +2397,16 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   }
 
   // Guest output painting descriptor sets.
-  VkDescriptorPoolSize guest_output_paint_descriptor_pool_size;
-  guest_output_paint_descriptor_pool_size.type =
-      guest_output_image_binding.descriptorType;
-  // Each descriptor set contains only 1 descriptor.
-  guest_output_paint_descriptor_pool_size.descriptorCount =
+  VkDescriptorPoolSize guest_output_paint_descriptor_pool_sizes[2];
+  guest_output_paint_descriptor_pool_sizes[0].type =
+      VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  guest_output_paint_descriptor_pool_sizes[0].descriptorCount =
+      PaintContext::kGuestOutputDescriptorSetCount;
+  // Required even when using immutable samplers, otherwise failing to allocate
+  // descriptor sets (tested on AMD Software: Adrenalin Edition 22.3.2 on
+  // Windows 10 on AMD Radeon RX Vega 10 with Vulkan validation enabled).
+  guest_output_paint_descriptor_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+  guest_output_paint_descriptor_pool_sizes[1].descriptorCount =
       PaintContext::kGuestOutputDescriptorSetCount;
   VkDescriptorPoolCreateInfo guest_output_paint_descriptor_pool_create_info;
   guest_output_paint_descriptor_pool_create_info.sType =
@@ -2406,9 +2415,10 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
   guest_output_paint_descriptor_pool_create_info.flags = 0;
   guest_output_paint_descriptor_pool_create_info.maxSets =
       PaintContext::kGuestOutputDescriptorSetCount;
-  guest_output_paint_descriptor_pool_create_info.poolSizeCount = 1;
+  guest_output_paint_descriptor_pool_create_info.poolSizeCount =
+      uint32_t(xe::countof(guest_output_paint_descriptor_pool_sizes));
   guest_output_paint_descriptor_pool_create_info.pPoolSizes =
-      &guest_output_paint_descriptor_pool_size;
+      guest_output_paint_descriptor_pool_sizes;
   if (dfn.vkCreateDescriptorPool(
           device, &guest_output_paint_descriptor_pool_create_info, nullptr,
           &paint_context_.guest_output_descriptor_pool) != VK_SUCCESS) {
@@ -2525,7 +2535,7 @@ VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(
   pipeline_create_info.renderPass = render_pass;
   pipeline_create_info.subpass = 0;
   pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
-  pipeline_create_info.basePipelineIndex = UINT32_MAX;
+  pipeline_create_info.basePipelineIndex = -1;
 
   const VulkanProvider::DeviceFunctions& dfn = provider_.dfn();
   VkDevice device = provider_.device();

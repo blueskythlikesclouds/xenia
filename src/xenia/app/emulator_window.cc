@@ -132,7 +132,7 @@ using xe::ui::KeyEvent;
 using xe::ui::MenuItem;
 using xe::ui::UIEvent;
 
-const std::string kBaseTitle = "Xenia (Unofficial SWA Hack, do NOT ask Xenia developers for tech support!)";
+const std::string kBaseTitle = "Xenia";
 
 EmulatorWindow::EmulatorWindow(Emulator* emulator,
                                ui::WindowedAppContext& app_context)
@@ -224,7 +224,7 @@ void EmulatorWindow::OnEmulatorInitialized() {
   // When the user can see that the emulator isn't initializing anymore (the
   // menu isn't disabled), enter fullscreen if requested.
   if (cvars::fullscreen) {
-    window_->SetFullscreen(true);
+    SetFullscreen(true);
   }
 }
 
@@ -270,6 +270,10 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
   }
   // Even if the close button has been pressed, still paint everything not to
   // have one frame with an empty window.
+
+  // Prevent user confusion which has been reported multiple times.
+  ImGui::TextUnformatted("All effects can be used on GPUs of any brand.");
+  ImGui::Spacing();
 
   gpu::CommandProcessor* command_processor =
       graphics_system->command_processor();

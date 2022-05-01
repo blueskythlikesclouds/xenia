@@ -25,8 +25,10 @@ namespace ui {
 namespace vulkan {
 
 // Generated with `xb buildshaders`.
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/immediate_frag.h"
-#include "xenia/ui/shaders/bytecode/vulkan_spirv/immediate_vert.h"
+namespace shaders {
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/immediate_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/immediate_vs.h"
+}  // namespace shaders
 
 VulkanImmediateDrawer::VulkanImmediateTexture::~VulkanImmediateTexture() {
   if (immediate_drawer_) {
@@ -424,7 +426,8 @@ void VulkanImmediateDrawer::End() {
       image_memory_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
       image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       image_memory_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      util::InitializeSubresourceRange(image_memory_barrier.subresourceRange);
+      image_memory_barrier.subresourceRange =
+          util::InitializeSubresourceRange();
       for (const PendingTextureUpload& pending_texture_upload :
            texture_uploads_pending_) {
         image_memory_barriers.emplace_back(image_memory_barrier).image =
@@ -578,8 +581,8 @@ bool VulkanImmediateDrawer::EnsurePipelinesCreatedForCurrentRenderPass() {
   VkPipelineShaderStageCreateInfo stages[2] = {};
   stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-  stages[0].module = util::CreateShaderModule(provider_, immediate_vert,
-                                              sizeof(immediate_vert));
+  stages[0].module = util::CreateShaderModule(provider_, shaders::immediate_vs,
+                                              sizeof(shaders::immediate_vs));
   if (stages[0].module == VK_NULL_HANDLE) {
     XELOGE("VulkanImmediateDrawer: Failed to create the vertex shader module");
     return false;
@@ -587,8 +590,8 @@ bool VulkanImmediateDrawer::EnsurePipelinesCreatedForCurrentRenderPass() {
   stages[0].pName = "main";
   stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-  stages[1].module = util::CreateShaderModule(provider_, immediate_frag,
-                                              sizeof(immediate_frag));
+  stages[1].module = util::CreateShaderModule(provider_, shaders::immediate_ps,
+                                              sizeof(shaders::immediate_ps));
   if (stages[1].module == VK_NULL_HANDLE) {
     XELOGE(
         "VulkanImmediateDrawer: Failed to create the fragment shader module");
@@ -703,7 +706,7 @@ bool VulkanImmediateDrawer::EnsurePipelinesCreatedForCurrentRenderPass() {
   pipeline_create_info.renderPass = vulkan_ui_draw_context.render_pass();
   pipeline_create_info.subpass = 0;
   pipeline_create_info.basePipelineHandle = VK_NULL_HANDLE;
-  pipeline_create_info.basePipelineIndex = UINT32_MAX;
+  pipeline_create_info.basePipelineIndex = -1;
   if (dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
                                     &pipeline_create_info, nullptr,
                                     &pipeline_triangle_) != VK_SUCCESS) {
@@ -911,7 +914,7 @@ bool VulkanImmediateDrawer::CreateTextureResource(
   image_view_create_info.components.g = swizzle;
   image_view_create_info.components.b = swizzle;
   image_view_create_info.components.a = swizzle;
-  util::InitializeSubresourceRange(image_view_create_info.subresourceRange);
+  image_view_create_info.subresourceRange = util::InitializeSubresourceRange();
   VkImageView image_view;
   if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr,
                             &image_view) != VK_SUCCESS) {

@@ -5,7 +5,7 @@
 //
 // Buffer Definitions: 
 //
-// cbuffer XeCasResampleConstants
+// cbuffer xesl_push_constants
 // {
 //
 //   int2 xe_cas_output_offset;         // Offset:    0 Size:     8
@@ -19,8 +19,8 @@
 //
 // Name                                 Type  Format         Dim      ID      HLSL Bind  Count
 // ------------------------------ ---------- ------- ----------- ------- -------------- ------
-// xe_texture                        texture  float3          2d      T0             t0      1 
-// XeCasResampleConstants            cbuffer      NA          NA     CB0            cb0      1 
+// xe_cas_source                     texture  float4          2d      T0             t0      1 
+// xesl_push_constants               cbuffer      NA          NA     CB0            cb0      1 
 //
 //
 //
@@ -472,7 +472,7 @@ mul_sat r1.xyz, r3.wwww, r1.xyzx
 sqrt r1.xyz, r1.xyzx
 bfi r0.y, l(4), l(4), r0.y, l(0)
 bfi r0.x, l(4), l(0), r0.x, r0.y
-add o0.xyz, r1.xyzx, icb[r0.x + 0].xxxx
+add_sat o0.xyz, r1.xyzx, icb[r0.x + 0].xxxx
 mov o0.w, l(1.000000)
 ret 
 // Approximately 175 instruction slots used
@@ -480,10 +480,10 @@ ret
 
 const BYTE guest_output_ffx_cas_resample_dither_ps[] =
 {
-     68,  88,  66,  67, 162, 124, 
-    243, 114, 220, 254,  28,  54, 
-     81,  63, 203,  49, 205, 242, 
-     53, 186,   1,   0,   0,   0, 
+     68,  88,  66,  67,  21,  92, 
+     80,   2, 197, 220, 181, 240, 
+    230,  52, 184, 130,  14, 196, 
+    203, 108,   1,   0,   0,   0, 
     220,  40,   0,   0,   5,   0, 
       0,   0,  52,   0,   0,   0, 
     120,   2,   0,   0, 172,   2, 
@@ -504,22 +504,22 @@ const BYTE guest_output_ffx_cas_resample_dither_ps[] =
       0,   0,   5,   0,   0,   0, 
       4,   0,   0,   0, 255, 255, 
     255, 255,   0,   0,   0,   0, 
-      1,   0,   0,   0,   8,   0, 
+      1,   0,   0,   0,  12,   0, 
       0,   0,   0,   0,   0,   0, 
-      0,   0,   0,   0, 151,   0, 
+      0,   0,   0,   0, 154,   0, 
       0,   0,   0,   0,   0,   0, 
       0,   0,   0,   0,   0,   0, 
       0,   0,   0,   0,   0,   0, 
       0,   0,   0,   0,   1,   0, 
       0,   0,   1,   0,   0,   0, 
       0,   0,   0,   0,   0,   0, 
-      0,   0, 120, 101,  95, 116, 
-    101, 120, 116, 117, 114, 101, 
-      0,  88, 101,  67,  97, 115, 
-     82, 101, 115,  97, 109, 112, 
-    108, 101,  67, 111, 110, 115, 
+      0,   0, 120, 101,  95,  99, 
+     97, 115,  95, 115, 111, 117, 
+    114,  99, 101,   0, 120, 101, 
+    115, 108,  95, 112, 117, 115, 
+    104,  95,  99, 111, 110, 115, 
     116,  97, 110, 116, 115,   0, 
-    171, 171, 151,   0,   0,   0, 
+    171, 171, 154,   0,   0,   0, 
       3,   0,   0,   0, 200,   0, 
       0,   0,  32,   0,   0,   0, 
       0,   0,   0,   0,   0,   0, 
@@ -2188,7 +2188,7 @@ const BYTE guest_output_ffx_cas_resample_dither_ps[] =
       0,   0,  10,   0,  16,   0, 
       0,   0,   0,   0,  26,   0, 
      16,   0,   0,   0,   0,   0, 
-      0,   0,   0,   8, 114,  32, 
+      0,  32,   0,   8, 114,  32, 
      16,   0,   0,   0,   0,   0, 
      70,   2,  16,   0,   1,   0, 
       0,   0,   6, 144, 144,   0, 

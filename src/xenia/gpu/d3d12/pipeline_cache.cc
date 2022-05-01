@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2020 Ben Vanik. All rights reserved.                             *
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -36,6 +36,7 @@
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
+#include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 
@@ -149,6 +150,7 @@ bool PipelineCache::Initialize() {
   creation_threads_busy_ = 0;
   creation_completion_event_ =
       xe::threading::Event::CreateManualResetEvent(true);
+  assert_not_null(creation_completion_event_);
   creation_completion_set_event_ = false;
   creation_threads_shutdown_from_ = SIZE_MAX;
   if (cvars::d3d12_pipeline_creation_threads != 0) {
@@ -164,6 +166,7 @@ bool PipelineCache::Initialize() {
     for (size_t i = 0; i < creation_thread_count; ++i) {
       std::unique_ptr<xe::threading::Thread> creation_thread =
           xe::threading::Thread::Create({}, [this, i]() { CreationThread(i); });
+      assert_not_null(creation_thread);
       creation_thread->set_name("D3D12 Pipelines");
       creation_threads_.push_back(std::move(creation_thread));
     }
@@ -540,9 +543,11 @@ void PipelineCache::InitializeShaderStorage(
       }
       while (shader_translation_threads.size() <
              shader_translation_threads_needed) {
-        shader_translation_threads.push_back(xe::threading::Thread::Create(
-            {}, shader_translation_thread_function));
-        shader_translation_threads.back()->set_name("Shader Translation");
+        auto thread = xe::threading::Thread::Create(
+            {}, shader_translation_thread_function);
+        assert_not_null(thread);
+        thread->set_name("Shader Translation");
+        shader_translation_threads.push_back(std::move(thread));
       }
       // Request ucode information gathering and translation of all the needed
       // shaders.
@@ -606,6 +611,7 @@ void PipelineCache::InitializeShaderStorage(
           xe::threading::Thread::Create({}, [this, creation_thread_index]() {
             CreationThread(creation_thread_index);
           });
+      assert_not_null(creation_thread);
       creation_thread->set_name("D3D12 Pipelines");
       creation_threads_.push_back(std::move(creation_thread));
     }
@@ -771,6 +777,8 @@ void PipelineCache::InitializeShaderStorage(
   storage_write_thread_shutdown_ = false;
   storage_write_thread_ =
       xe::threading::Thread::Create({}, [this]() { StorageWriteThread(); });
+  assert_not_null(storage_write_thread_);
+  storage_write_thread_->set_name("D3D12 Storage writer");
 }
 
 void PipelineCache::ShutdownShaderStorage() {
@@ -889,7 +897,8 @@ PipelineCache::GetCurrentVertexShaderModification(
 }
 
 DxbcShaderTranslator::Modification
-PipelineCache::GetCurrentPixelShaderModification(const Shader& shader) const {
+PipelineCache::GetCurrentPixelShaderModification(
+    const Shader& shader, reg::RB_DEPTHCONTROL normalized_depth_control) const {
   assert_true(shader.type() == xenos::ShaderType::kPixel);
   assert_true(shader.is_ucode_analyzed());
   const auto& regs = register_file_;
@@ -908,7 +917,7 @@ PipelineCache::GetCurrentPixelShaderModification(const Shader& shader) const {
              RenderTargetCache::DepthFloat24Conversion::kOnOutputTruncating ||
          depth_float24_conversion ==
              RenderTargetCache::DepthFloat24Conversion::kOnOutputRounding) &&
-        draw_util::GetDepthControlForCurrentEdramMode(regs).z_enable &&
+        normalized_depth_control.z_enable &&
         regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
             xenos::DepthRenderTargetFormat::kD24FS8) {
       modification.pixel.depth_stencil_mode =
@@ -934,6 +943,8 @@ bool PipelineCache::ConfigurePipeline(
     D3D12Shader::D3D12Translation* vertex_shader,
     D3D12Shader::D3D12Translation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask,
     uint32_t bound_depth_and_color_render_target_bits,
     const uint32_t* bound_depth_and_color_render_target_formats,
     void** pipeline_handle_out, ID3D12RootSignature** root_signature_out) {
@@ -1005,6 +1016,7 @@ bool PipelineCache::ConfigurePipeline(
   PipelineRuntimeDescription runtime_description;
   if (!GetCurrentStateDescription(
           vertex_shader, pixel_shader, primitive_processing_result,
+          normalized_depth_control, normalized_color_mask,
           bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, runtime_description)) {
     return false;
@@ -1272,6 +1284,8 @@ bool PipelineCache::GetCurrentStateDescription(
     D3D12Shader::D3D12Translation* vertex_shader,
     D3D12Shader::D3D12Translation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask,
     uint32_t bound_depth_and_color_render_target_bits,
     const uint32_t* bound_depth_and_color_render_target_formats,
     PipelineRuntimeDescription& runtime_description_out) {
@@ -1409,7 +1423,6 @@ bool PipelineCache::GetCurrentStateDescription(
   // rasterization will be disabled externally, or the draw call will be dropped
   // early if the vertex shader doesn't export to memory.
   bool cull_front, cull_back;
-  float poly_offset = 0.0f, poly_offset_scale = 0.0f;
   if (primitive_polygonal) {
     description_out.front_counter_clockwise = pa_su_sc_mode_cntl.face == 0;
     cull_front = pa_su_sc_mode_cntl.cull_front != 0;
@@ -1433,23 +1446,12 @@ bool PipelineCache::GetCurrentStateDescription(
           xenos::PolygonType::kTriangles) {
         description_out.fill_mode_wireframe = 1;
       }
-      if (!edram_rov_used && pa_su_sc_mode_cntl.poly_offset_front_enable) {
-        poly_offset = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET].f32;
-        poly_offset_scale = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE].f32;
-      }
     }
     if (!cull_back) {
       // Back faces aren't culled.
       if (pa_su_sc_mode_cntl.polymode_back_ptype !=
           xenos::PolygonType::kTriangles) {
         description_out.fill_mode_wireframe = 1;
-      }
-      // Prefer front depth bias because in general, front faces are the ones
-      // that are rendered (except for shadow volumes).
-      if (!edram_rov_used && pa_su_sc_mode_cntl.poly_offset_back_enable &&
-          poly_offset == 0.0f && poly_offset_scale == 0.0f) {
-        poly_offset = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET].f32;
-        poly_offset_scale = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE].f32;
       }
     }
     if (pa_su_sc_mode_cntl.poly_mode != xenos::PolygonModeEnable::kDualMode) {
@@ -1459,24 +1461,23 @@ bool PipelineCache::GetCurrentStateDescription(
     // Filled front faces only, without culling.
     cull_front = false;
     cull_back = false;
-    if (!edram_rov_used && pa_su_sc_mode_cntl.poly_offset_para_enable) {
-      poly_offset = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET].f32;
-      poly_offset_scale = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE].f32;
-    }
   }
   if (!edram_rov_used) {
-    float poly_offset_host_scale = draw_util::GetD3D10PolygonOffsetFactor(
+    float polygon_offset, polygon_offset_scale;
+    draw_util::GetPreferredFacePolygonOffset(
+        regs, primitive_polygonal, polygon_offset_scale, polygon_offset);
+    float polygon_offset_host_scale = draw_util::GetD3D10PolygonOffsetFactor(
         regs.Get<reg::RB_DEPTH_INFO>().depth_format, true);
     // Using ceil here just in case a game wants the offset but passes a value
     // that is too small - it's better to apply more offset than to make depth
     // fighting worse or to disable the offset completely (Direct3D 12 takes an
     // integer value).
     description_out.depth_bias =
-        int32_t(std::ceil(std::abs(poly_offset * poly_offset_host_scale))) *
-        (poly_offset < 0.0f ? -1 : 1);
-    // "slope computed in subpixels ([...] 1/16)" - R5xx Acceleration.
+        int32_t(
+            std::ceil(std::abs(polygon_offset * polygon_offset_host_scale))) *
+        (polygon_offset < 0.0f ? -1 : 1);
     description_out.depth_bias_slope_scaled =
-        poly_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+        polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
   }
   if (tessellated && cvars::d3d12_tessellation_wireframe) {
     description_out.fill_mode_wireframe = 1;
@@ -1487,18 +1488,16 @@ bool PipelineCache::GetCurrentStateDescription(
     // Depth/stencil. No stencil, always passing depth test and no depth writing
     // means depth disabled.
     if (bound_depth_and_color_render_target_bits & 1) {
-      auto rb_depthcontrol =
-          draw_util::GetDepthControlForCurrentEdramMode(regs);
-      if (rb_depthcontrol.z_enable) {
-        description_out.depth_func = rb_depthcontrol.zfunc;
-        description_out.depth_write = rb_depthcontrol.z_write_enable;
+      if (normalized_depth_control.z_enable) {
+        description_out.depth_func = normalized_depth_control.zfunc;
+        description_out.depth_write = normalized_depth_control.z_write_enable;
       } else {
         description_out.depth_func = xenos::CompareFunction::kAlways;
       }
-      if (rb_depthcontrol.stencil_enable) {
+      if (normalized_depth_control.stencil_enable) {
         description_out.stencil_enable = 1;
         bool stencil_backface_enable =
-            primitive_polygonal && rb_depthcontrol.backface_enable;
+            primitive_polygonal && normalized_depth_control.backface_enable;
         // Per-face masks not supported by Direct3D 12, choose the back face
         // ones only if drawing only back faces.
         Register stencil_ref_mask_reg;
@@ -1511,18 +1510,23 @@ bool PipelineCache::GetCurrentStateDescription(
             regs.Get<reg::RB_STENCILREFMASK>(stencil_ref_mask_reg);
         description_out.stencil_read_mask = stencil_ref_mask.stencilmask;
         description_out.stencil_write_mask = stencil_ref_mask.stencilwritemask;
-        description_out.stencil_front_fail_op = rb_depthcontrol.stencilfail;
+        description_out.stencil_front_fail_op =
+            normalized_depth_control.stencilfail;
         description_out.stencil_front_depth_fail_op =
-            rb_depthcontrol.stencilzfail;
-        description_out.stencil_front_pass_op = rb_depthcontrol.stencilzpass;
-        description_out.stencil_front_func = rb_depthcontrol.stencilfunc;
+            normalized_depth_control.stencilzfail;
+        description_out.stencil_front_pass_op =
+            normalized_depth_control.stencilzpass;
+        description_out.stencil_front_func =
+            normalized_depth_control.stencilfunc;
         if (stencil_backface_enable) {
-          description_out.stencil_back_fail_op = rb_depthcontrol.stencilfail_bf;
+          description_out.stencil_back_fail_op =
+              normalized_depth_control.stencilfail_bf;
           description_out.stencil_back_depth_fail_op =
-              rb_depthcontrol.stencilzfail_bf;
+              normalized_depth_control.stencilzfail_bf;
           description_out.stencil_back_pass_op =
-              rb_depthcontrol.stencilzpass_bf;
-          description_out.stencil_back_func = rb_depthcontrol.stencilfunc_bf;
+              normalized_depth_control.stencilzpass_bf;
+          description_out.stencil_back_func =
+              normalized_depth_control.stencilfunc_bf;
         } else {
           description_out.stencil_back_fail_op =
               description_out.stencil_front_fail_op;
@@ -1547,10 +1551,6 @@ bool PipelineCache::GetCurrentStateDescription(
 
     // Render targets and blending state. 32 because of 0x1F mask, for safety
     // (all unknown to zero).
-    uint32_t color_mask =
-        pixel_shader ? command_processor_.GetCurrentColorMask(
-                           pixel_shader->shader().writes_color_targets())
-                     : 0;
     static const PipelineBlendFactor kBlendFactorMap[32] = {
         /*  0 */ PipelineBlendFactor::kZero,
         /*  1 */ PipelineBlendFactor::kOne,
@@ -1622,8 +1622,7 @@ bool PipelineCache::GetCurrentStateDescription(
           reg::RB_COLOR_INFO::rt_register_indices[i]);
       rt.format = xenos::ColorRenderTargetFormat(
           bound_depth_and_color_render_target_formats[1 + i]);
-      // TODO(Triang3l): Normalize unused bits of the color write mask.
-      rt.write_mask = (color_mask >> (i * 4)) & 0xF;
+      rt.write_mask = (normalized_color_mask >> (i * 4)) & 0xF;
       if (rt.write_mask) {
         auto blendcontrol = regs.Get<reg::RB_BLENDCONTROL>(
             reg::RB_BLENDCONTROL::rt_register_indices[i]);
@@ -1996,10 +1995,11 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         D3D12_BLEND_BLEND_FACTOR,  D3D12_BLEND_INV_BLEND_FACTOR,
         D3D12_BLEND_SRC_ALPHA_SAT,
     };
+    // 8 entries for safety since 3 bits from the guest are passed directly.
     static const D3D12_BLEND_OP kBlendOpMap[] = {
         D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_SUBTRACT,     D3D12_BLEND_OP_MIN,
-        D3D12_BLEND_OP_MAX, D3D12_BLEND_OP_REV_SUBTRACT,
-    };
+        D3D12_BLEND_OP_MAX, D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_OP_ADD,
+        D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_ADD};
     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
       const PipelineRenderTarget& rt = description.render_targets[i];
       if (!rt.used) {
@@ -2017,9 +2017,6 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
       }
       D3D12_RENDER_TARGET_BLEND_DESC& blend_desc =
           state_desc.BlendState.RenderTarget[i];
-      // Treat 1 * src + 0 * dest as disabled blending (there are opaque
-      // surfaces drawn with blending enabled, but it's 1 * src + 0 * dest, in
-      // 415607E6 - GPU performance is better when not blending.
       if (rt.src_blend != PipelineBlendFactor::kOne ||
           rt.dest_blend != PipelineBlendFactor::kZero ||
           rt.blend_op != xenos::BlendOp::kAdd ||

@@ -22,6 +22,7 @@
 #include "xenia/gpu/d3d12/d3d12_shader.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
+#include "xenia/gpu/registers.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/ui/d3d12/d3d12_presenter.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
@@ -103,27 +104,11 @@ void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
   render_target_cache_->RestoreEdramSnapshot(snapshot);
 }
 
-uint32_t D3D12CommandProcessor::GetCurrentColorMask(
-    uint32_t shader_writes_color_targets) const {
-  auto& regs = *register_file_;
-  if (regs.Get<reg::RB_MODECONTROL>().edram_mode !=
-      xenos::ModeControl::kColorDepth) {
-    return 0;
-  }
-  uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK].u32 & 0xFFFF;
-  for (uint32_t i = 0; i < 4; ++i) {
-    if (!(shader_writes_color_targets & (1 << i))) {
-      color_mask &= ~(0xF << (i * 4));
-    }
-  }
-  return color_mask;
-}
-
-void D3D12CommandProcessor::PushTransitionBarrier(
+bool D3D12CommandProcessor::PushTransitionBarrier(
     ID3D12Resource* resource, D3D12_RESOURCE_STATES old_state,
     D3D12_RESOURCE_STATES new_state, UINT subresource) {
   if (old_state == new_state) {
-    return;
+    return false;
   }
   D3D12_RESOURCE_BARRIER barrier;
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -133,6 +118,7 @@ void D3D12CommandProcessor::PushTransitionBarrier(
   barrier.Transition.StateBefore = old_state;
   barrier.Transition.StateAfter = new_state;
   barriers_.push_back(barrier);
+  return true;
 }
 
 void D3D12CommandProcessor::PushAliasingBarrier(ID3D12Resource* old_resource,
@@ -699,7 +685,7 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(
 void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
   if (current_external_pipeline_ != pipeline) {
     current_external_pipeline_ = pipeline;
-    current_cached_pipeline_ = nullptr;
+    current_guest_pipeline_ = nullptr;
     deferred_command_list_.D3DSetPipelineState(pipeline);
   }
 }
@@ -723,7 +709,7 @@ void D3D12CommandProcessor::SetViewport(const D3D12_VIEWPORT& viewport) {
   ff_viewport_update_needed_ |= ff_viewport_.MaxDepth != viewport.MaxDepth;
   if (ff_viewport_update_needed_) {
     ff_viewport_ = viewport;
-    deferred_command_list_.RSSetViewport(viewport);
+    deferred_command_list_.RSSetViewport(ff_viewport_);
     ff_viewport_update_needed_ = false;
   }
 }
@@ -735,7 +721,7 @@ void D3D12CommandProcessor::SetScissorRect(const D3D12_RECT& scissor_rect) {
   ff_scissor_update_needed_ |= ff_scissor_.bottom != scissor_rect.bottom;
   if (ff_scissor_update_needed_) {
     ff_scissor_ = scissor_rect;
-    deferred_command_list_.RSSetScissorRect(scissor_rect);
+    deferred_command_list_.RSSetScissorRect(ff_scissor_);
     ff_scissor_update_needed_ = false;
   }
 }
@@ -861,7 +847,8 @@ bool D3D12CommandProcessor::SetupContext() {
   // Initialize the render target cache before configuring binding - need to
   // know if using rasterizer-ordered views for the bindless root signature.
   render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
-      *register_file_, *this, trace_writer_, bindless_resources_used_);
+      *register_file_, *memory_, trace_writer_, *this,
+      bindless_resources_used_);
   if (!render_target_cache_->Initialize()) {
     XELOGE("Failed to initialize the render target cache");
     return false;
@@ -2142,20 +2129,26 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     return true;
   }
 
+  reg::RB_DEPTHCONTROL normalized_depth_control =
+      draw_util::GetNormalizedDepthControl(regs);
+
   // Shader modifications.
   DxbcShaderTranslator::Modification vertex_shader_modification =
       pipeline_cache_->GetCurrentVertexShaderModification(
           *vertex_shader, primitive_processing_result.host_vertex_shader_type);
   DxbcShaderTranslator::Modification pixel_shader_modification =
-      pixel_shader
-          ? pipeline_cache_->GetCurrentPixelShaderModification(*pixel_shader)
-          : DxbcShaderTranslator::Modification(0);
+      pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
+                         *pixel_shader, normalized_depth_control)
+                   : DxbcShaderTranslator::Modification(0);
 
   // Set up the render targets - this may perform dispatches and draws.
-  uint32_t pixel_shader_writes_color_targets =
-      pixel_shader ? pixel_shader->writes_color_targets() : 0;
+  uint32_t normalized_color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(
+                         regs, pixel_shader->writes_color_targets())
+                   : 0;
   if (!render_target_cache_->Update(is_rasterization_done,
-                                    pixel_shader_writes_color_targets)) {
+                                    normalized_depth_control,
+                                    normalized_color_mask, *vertex_shader)) {
     return false;
   }
 
@@ -2186,7 +2179,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   ID3D12RootSignature* root_signature;
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation,
-          primitive_processing_result, bound_depth_and_color_render_target_bits,
+          primitive_processing_result, normalized_depth_control,
+          normalized_color_mask, bound_depth_and_color_render_target_bits,
           bound_depth_and_color_render_target_formats, &pipeline_handle,
           &root_signature)) {
     return false;
@@ -2202,10 +2196,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
-  if (current_cached_pipeline_ != pipeline_handle) {
+  if (current_guest_pipeline_ != pipeline_handle) {
     deferred_command_list_.SetPipelineStateHandle(
         reinterpret_cast<void*>(pipeline_handle));
-    current_cached_pipeline_ = pipeline_handle;
+    current_guest_pipeline_ = pipeline_handle;
     current_external_pipeline_ = nullptr;
   }
 
@@ -2218,6 +2212,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   draw_util::GetHostViewportInfo(
       regs, resolution_scale_x, resolution_scale_y, true,
       D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
+      normalized_depth_control,
       host_render_targets_used &&
           (depth_float24_conversion ==
                RenderTargetCache::DepthFloat24Conversion::kOnOutputTruncating ||
@@ -2233,7 +2228,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   scissor.extent[1] *= resolution_scale_y;
 
   // Update viewport, scissor, blend factor and stencil reference.
-  UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal);
+  UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal,
+                           normalized_depth_control);
 
   // Update system constants before uploading them.
   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
@@ -2241,9 +2237,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       memexport_used, primitive_polygonal,
       primitive_processing_result.line_loop_closing_index,
       primitive_processing_result.host_index_endian, viewport_info,
-      used_texture_mask,
-      pixel_shader ? GetCurrentColorMask(pixel_shader->writes_color_targets())
-                   : 0);
+      used_texture_mask, normalized_depth_control, normalized_color_mask);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature)) {
@@ -2814,7 +2808,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     ff_scissor_update_needed_ = true;
     ff_blend_factor_update_needed_ = true;
     ff_stencil_ref_update_needed_ = true;
-    current_cached_pipeline_ = nullptr;
+    current_guest_pipeline_ = nullptr;
     current_external_pipeline_ = nullptr;
     current_graphics_root_signature_ = nullptr;
     current_graphics_root_up_to_date_ = 0;
@@ -3043,7 +3037,8 @@ void D3D12CommandProcessor::ClearCommandAllocatorCache() {
 
 void D3D12CommandProcessor::UpdateFixedFunctionState(
     const draw_util::ViewportInfo& viewport_info,
-    const draw_util::Scissor& scissor, bool primitive_polygonal) {
+    const draw_util::Scissor& scissor, bool primitive_polygonal,
+    reg::RB_DEPTHCONTROL normalized_depth_control) {
 #if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
@@ -3071,19 +3066,18 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
     const RegisterFile& regs = *register_file_;
 
     // Blend factor.
+    float blend_factor[] = {
+        regs[XE_GPU_REG_RB_BLEND_RED].f32,
+        regs[XE_GPU_REG_RB_BLEND_GREEN].f32,
+        regs[XE_GPU_REG_RB_BLEND_BLUE].f32,
+        regs[XE_GPU_REG_RB_BLEND_ALPHA].f32,
+    };
+    // std::memcmp instead of != so in case of NaN, every draw won't be
+    // invalidating it.
     ff_blend_factor_update_needed_ |=
-        ff_blend_factor_[0] != regs[XE_GPU_REG_RB_BLEND_RED].f32;
-    ff_blend_factor_update_needed_ |=
-        ff_blend_factor_[1] != regs[XE_GPU_REG_RB_BLEND_GREEN].f32;
-    ff_blend_factor_update_needed_ |=
-        ff_blend_factor_[2] != regs[XE_GPU_REG_RB_BLEND_BLUE].f32;
-    ff_blend_factor_update_needed_ |=
-        ff_blend_factor_[3] != regs[XE_GPU_REG_RB_BLEND_ALPHA].f32;
+        std::memcmp(ff_blend_factor_, blend_factor, sizeof(float) * 4) != 0;
     if (ff_blend_factor_update_needed_) {
-      ff_blend_factor_[0] = regs[XE_GPU_REG_RB_BLEND_RED].f32;
-      ff_blend_factor_[1] = regs[XE_GPU_REG_RB_BLEND_GREEN].f32;
-      ff_blend_factor_[2] = regs[XE_GPU_REG_RB_BLEND_BLUE].f32;
-      ff_blend_factor_[3] = regs[XE_GPU_REG_RB_BLEND_ALPHA].f32;
+      std::memcpy(ff_blend_factor_, blend_factor, sizeof(float) * 4);
       deferred_command_list_.D3DOMSetBlendFactor(ff_blend_factor_);
       ff_blend_factor_update_needed_ = false;
     }
@@ -3092,8 +3086,7 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
     // choose the back face one only if drawing only back faces.
     Register stencil_ref_mask_reg;
     auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
-    if (primitive_polygonal &&
-        draw_util::GetDepthControlForCurrentEdramMode(regs).backface_enable &&
+    if (primitive_polygonal && normalized_depth_control.backface_enable &&
         pa_su_sc_mode_cntl.cull_front && !pa_su_sc_mode_cntl.cull_back) {
       stencil_ref_mask_reg = XE_GPU_REG_RB_STENCILREFMASK_BF;
     } else {
@@ -3104,7 +3097,7 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
     ff_stencil_ref_update_needed_ |= ff_stencil_ref_ != stencil_ref;
     if (ff_stencil_ref_update_needed_) {
       ff_stencil_ref_ = stencil_ref;
-      deferred_command_list_.D3DOMSetStencilRef(stencil_ref);
+      deferred_command_list_.D3DOMSetStencilRef(ff_stencil_ref_);
       ff_stencil_ref_update_needed_ = false;
     }
   }
@@ -3114,7 +3107,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     bool shared_memory_is_uav, bool primitive_polygonal,
     uint32_t line_loop_closing_index, xenos::Endian index_endian,
     const draw_util::ViewportInfo& viewport_info, uint32_t used_texture_mask,
-    uint32_t color_mask) {
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask) {
 #if XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_UI_D3D12_FINE_GRAINED_DRAW_SCOPES
@@ -3128,7 +3122,6 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   float rb_alpha_ref = regs[XE_GPU_REG_RB_ALPHA_REF].f32;
   auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
   auto rb_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
-  auto rb_depthcontrol = draw_util::GetDepthControlForCurrentEdramMode(regs);
   auto rb_stencilrefmask = regs.Get<reg::RB_STENCILREFMASK>();
   auto rb_stencilrefmask_bf =
       regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
@@ -3161,7 +3154,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       // Get the mask for keeping previous color's components unmodified,
       // or two UINT32_MAX if no colors actually existing in the RT are written.
       DxbcShaderTranslator::ROV_GetColorFormatSystemConstants(
-          color_info.color_format, (color_mask >> (i * 4)) & 0b1111,
+          color_info.color_format, (normalized_color_mask >> (i * 4)) & 0b1111,
           rt_clamp[i][0], rt_clamp[i][1], rt_clamp[i][2], rt_clamp[i][3],
           rt_keep_masks[i][0], rt_keep_masks[i][1]);
     }
@@ -3170,8 +3163,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   // Disable depth and stencil if it aliases a color render target (for
   // instance, during the XBLA logo in 58410954, though depth writing is already
   // disabled there).
-  bool depth_stencil_enabled =
-      rb_depthcontrol.stencil_enable || rb_depthcontrol.z_enable;
+  bool depth_stencil_enabled = normalized_depth_control.stencil_enable ||
+                               normalized_depth_control.z_enable;
   if (edram_rov_used && depth_stencil_enabled) {
     for (uint32_t i = 0; i < 4; ++i) {
       if (rb_depth_info.depth_base == color_infos[i].color_base &&
@@ -3244,10 +3237,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
   if (edram_rov_used && depth_stencil_enabled) {
     flags |= DxbcShaderTranslator::kSysFlag_ROVDepthStencil;
-    if (rb_depthcontrol.z_enable) {
-      flags |= uint32_t(rb_depthcontrol.zfunc)
+    if (normalized_depth_control.z_enable) {
+      flags |= uint32_t(normalized_depth_control.zfunc)
                << DxbcShaderTranslator::kSysFlag_ROVDepthPassIfLess_Shift;
-      if (rb_depthcontrol.z_write_enable) {
+      if (normalized_depth_control.z_write_enable) {
         flags |= DxbcShaderTranslator::kSysFlag_ROVDepthWrite;
       }
     } else {
@@ -3257,7 +3250,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
                DxbcShaderTranslator::kSysFlag_ROVDepthPassIfEqual |
                DxbcShaderTranslator::kSysFlag_ROVDepthPassIfGreater;
     }
-    if (rb_depthcontrol.stencil_enable) {
+    if (normalized_depth_control.stencil_enable) {
       flags |= DxbcShaderTranslator::kSysFlag_ROVStencilTest;
     }
     // Hint - if not applicable to the shader, will not have effect.
@@ -3541,7 +3534,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
              poly_offset_back_offset;
     system_constants_.edram_poly_offset_back_offset = poly_offset_back_offset;
 
-    if (depth_stencil_enabled && rb_depthcontrol.stencil_enable) {
+    if (depth_stencil_enabled && normalized_depth_control.stencil_enable) {
       dirty |= system_constants_.edram_stencil_front_reference !=
                rb_stencilrefmask.stencilref;
       system_constants_.edram_stencil_front_reference =
@@ -3555,12 +3548,12 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       system_constants_.edram_stencil_front_write_mask =
           rb_stencilrefmask.stencilwritemask;
       uint32_t stencil_func_ops =
-          (rb_depthcontrol.value >> 8) & ((1 << 12) - 1);
+          (normalized_depth_control.value >> 8) & ((1 << 12) - 1);
       dirty |=
           system_constants_.edram_stencil_front_func_ops != stencil_func_ops;
       system_constants_.edram_stencil_front_func_ops = stencil_func_ops;
 
-      if (primitive_polygonal && rb_depthcontrol.backface_enable) {
+      if (primitive_polygonal && normalized_depth_control.backface_enable) {
         dirty |= system_constants_.edram_stencil_back_reference !=
                  rb_stencilrefmask_bf.stencilref;
         system_constants_.edram_stencil_back_reference =
@@ -3574,7 +3567,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
         system_constants_.edram_stencil_back_write_mask =
             rb_stencilrefmask_bf.stencilwritemask;
         uint32_t stencil_func_ops_bf =
-            (rb_depthcontrol.value >> 20) & ((1 << 12) - 1);
+            (normalized_depth_control.value >> 20) & ((1 << 12) - 1);
         dirty |= system_constants_.edram_stencil_back_func_ops !=
                  stencil_func_ops_bf;
         system_constants_.edram_stencil_back_func_ops = stencil_func_ops_bf;

@@ -81,7 +81,7 @@ void PPCHIRBuilder::Reset() {
   HIRBuilder::Reset();
 }
 
-// A bunch of very game specific (and very dumb) hacks to suppress NaN blackouts in Sonic Unleashed.
+// A bunch of very game specific (and very dumb) hacks to suppress NaN/INF blackouts in Sonic Unleashed.
 // These are the actual functions that cause them, and suppressing them seems to work fine.
 
 // Addresses are based on 53450812 v1.0.2 title update XEX.
@@ -218,26 +218,40 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
         continue;
       }
 
-      // Main idea is to replace NaNs with 0s.
+      // Main idea is to replace NaNs/INFs with 0s.
 
       Value* v = LoadGPR(swa_hacks[i].gpr);
+
       Value* x_address = Add(v, LoadConstantUint64(0));
       Value* y_address = Add(v, LoadConstantUint64(4));
       Value* z_address = Add(v, LoadConstantUint64(8));
       Value* w_address = Add(v, LoadConstantUint64(12));
+
       Value* x = Load(x_address, INT32_TYPE);
       Value* y = Load(y_address, INT32_TYPE);
       Value* z = Load(z_address, INT32_TYPE);
       Value* w = Load(w_address, INT32_TYPE);
-      Value* isnan_x = IsNan(Cast(ByteSwap(x), FLOAT32_TYPE));
-      Value* isnan_y = IsNan(Cast(ByteSwap(y), FLOAT32_TYPE));
-      Value* isnan_z = IsNan(Cast(ByteSwap(z), FLOAT32_TYPE));
-      Value* isnan_w = IsNan(Cast(ByteSwap(w), FLOAT32_TYPE));
 
-      Store(x_address, Select(isnan_x, LoadZeroInt32(), x));
-      Store(y_address, Select(isnan_y, LoadZeroInt32(), y));
-      Store(z_address, Select(isnan_z, LoadZeroInt32(), z));
-      Store(w_address, Select(isnan_w, LoadZeroInt32(), w));
+      Value* x_invalid = Or(IsNan(Cast(ByteSwap(x), FLOAT32_TYPE)),
+                          CompareEQ(And(x, LoadConstantUint32(0xFFFFFF7F)),
+                                    LoadConstantUint32(0x807F)));
+
+      Value* y_invalid = Or(IsNan(Cast(ByteSwap(y), FLOAT32_TYPE)),
+                          CompareEQ(And(y, LoadConstantUint32(0xFFFFFF7F)),
+                                    LoadConstantUint32(0x807F)));
+
+      Value* z_invalid = Or(IsNan(Cast(ByteSwap(z), FLOAT32_TYPE)),
+                          CompareEQ(And(z, LoadConstantUint32(0xFFFFFF7F)),
+                                    LoadConstantUint32(0x807F)));
+
+      Value* w_invalid = Or(IsNan(Cast(ByteSwap(w), FLOAT32_TYPE)),
+                          CompareEQ(And(w, LoadConstantUint32(0xFFFFFF7F)),
+                                    LoadConstantUint32(0x807F)));
+
+      Store(x_address, Select(x_invalid, LoadZeroInt32(), x));
+      Store(y_address, Select(y_invalid, LoadZeroInt32(), y));
+      Store(z_address, Select(z_invalid, LoadZeroInt32(), z));
+      Store(w_address, Select(w_invalid, LoadZeroInt32(), w));
     }
 
     trace_info_.dest_count = 0;

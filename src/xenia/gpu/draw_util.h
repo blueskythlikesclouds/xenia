@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2020 Ben Vanik. All rights reserved.                             *
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -84,18 +84,7 @@ bool IsRasterizationPotentiallyDone(const RegisterFile& regs,
 extern const int8_t kD3D10StandardSamplePositions2x[2][2];
 extern const int8_t kD3D10StandardSamplePositions4x[4][2];
 
-inline reg::RB_DEPTHCONTROL GetDepthControlForCurrentEdramMode(
-    const RegisterFile& regs) {
-  xenos::ModeControl edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
-  if (edram_mode != xenos::ModeControl::kColorDepth &&
-      edram_mode != xenos::ModeControl::kDepth) {
-    // Both depth and stencil disabled (EDRAM depth and stencil ignored).
-    reg::RB_DEPTHCONTROL disabled;
-    disabled.value = 0;
-    return disabled;
-  }
-  return regs.Get<reg::RB_DEPTHCONTROL>();
-}
+reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs);
 
 constexpr float GetD3D10PolygonOffsetFactor(
     xenos::DepthRenderTargetFormat depth_format, bool float24_as_0_to_0_5) {
@@ -121,6 +110,16 @@ constexpr float GetD3D10PolygonOffsetFactor(
   // scaling from the viewport.
   return float24_as_0_to_0_5 ? kFloat24Scale * 0.5f : kFloat24Scale;
 }
+
+// For hosts not supporting separate front and back polygon offsets, returns the
+// polygon offset for the face which likely needs the offset the most (and that
+// will not be culled). The values returned will have the units of the original
+// registers (the scale is for 1/16 subpixels, multiply by
+// xenos::kPolygonOffsetScaleSubpixelUnit outside if the value for pixels is
+// needed).
+void GetPreferredFacePolygonOffset(const RegisterFile& regs,
+                                   bool primitive_polygonal, float& scale_out,
+                                   float& offset_out);
 
 inline bool DoesCoverageDependOnAlpha(reg::RB_COLORCONTROL rb_colorcontrol) {
   return (rb_colorcontrol.alpha_test_enable &&
@@ -173,6 +172,7 @@ struct ViewportInfo {
 void GetHostViewportInfo(const RegisterFile& regs, uint32_t resolution_scale_x,
                          uint32_t resolution_scale_y, bool origin_bottom_left,
                          uint32_t x_max, uint32_t y_max, bool allow_reverse_z,
+                         reg::RB_DEPTHCONTROL normalized_depth_control,
                          bool convert_z_to_float24, bool full_float24_in_0_to_1,
                          bool pixel_shader_writes_depth,
                          ViewportInfo& viewport_info_out);
@@ -185,6 +185,17 @@ struct Scissor {
 };
 void GetScissor(const RegisterFile& regs, Scissor& scissor_out,
                 bool clamp_to_surface_pitch = true);
+
+// Returns the color component write mask for the draw command taking into
+// account which color targets are written to by the pixel shader, as well as
+// components that don't exist in the formats of the render targets (render
+// targets with only non-existent components written are skipped, but
+// non-existent components are forced to written if some existing components of
+// the render target are actually used to make sure the host driver doesn't try
+// to take a slow path involving reading and mixing if there are any disabled
+// components even if they don't actually exist).
+uint32_t GetNormalizedColorMask(const RegisterFile& regs,
+                                uint32_t pixel_shader_writes_color_targets);
 
 // Scales, and shift amounts of the upper 32 bits of the 32x32=64-bit
 // multiplication result, for fast division and multiplication by

@@ -124,17 +124,18 @@ inline VkExtent2D GetMax2DFramebufferExtent(const VulkanProvider& provider) {
   return max_extent;
 }
 
-inline void InitializeSubresourceRange(
-    VkImageSubresourceRange& range,
+inline VkImageSubresourceRange InitializeSubresourceRange(
     VkImageAspectFlags aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
     uint32_t base_mip_level = 0, uint32_t level_count = VK_REMAINING_MIP_LEVELS,
     uint32_t base_array_layer = 0,
     uint32_t layer_count = VK_REMAINING_ARRAY_LAYERS) {
+  VkImageSubresourceRange range;
   range.aspectMask = aspect_mask;
   range.baseMipLevel = base_mip_level;
   range.levelCount = level_count;
   range.baseArrayLayer = base_array_layer;
   range.layerCount = layer_count;
+  return range;
 }
 
 // Creates a buffer backed by a dedicated allocation. The allocation size will
@@ -155,13 +156,14 @@ bool CreateDedicatedAllocationImage(const VulkanProvider& provider,
                                     VkDeviceSize* memory_size_out = nullptr);
 
 inline VkShaderModule CreateShaderModule(const VulkanProvider& provider,
-                                         const void* code, size_t code_size) {
+                                         const uint32_t* code,
+                                         size_t code_size_bytes) {
   VkShaderModuleCreateInfo shader_module_create_info;
   shader_module_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
   shader_module_create_info.pNext = nullptr;
   shader_module_create_info.flags = 0;
-  shader_module_create_info.codeSize = code_size;
-  shader_module_create_info.pCode = reinterpret_cast<const uint32_t*>(code);
+  shader_module_create_info.codeSize = code_size_bytes;
+  shader_module_create_info.pCode = code;
   VkShaderModule shader_module;
   return provider.dfn().vkCreateShaderModule(
              provider.device(), &shader_module_create_info, nullptr,

@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2018 Xenia Developers. All rights reserved.                      *
+ * Copyright 2022 Xenia Developers. All rights reserved.                      *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -1287,7 +1287,6 @@ static __m128i EmulateVectorRotateLeft(void*, __m128i src1, __m128i src2) {
   return _mm_load_si128(reinterpret_cast<__m128i*>(value));
 }
 
-// TODO(benvanik): AVX512 has a native variable rotate (rolv).
 struct VECTOR_ROTATE_LEFT_V128
     : Sequence<VECTOR_ROTATE_LEFT_V128,
                I<OPCODE_VECTOR_ROTATE_LEFT, V128Op, V128Op, V128Op>> {
@@ -1318,7 +1317,9 @@ struct VECTOR_ROTATE_LEFT_V128
         e.vmovaps(i.dest, e.xmm0);
         break;
       case INT32_TYPE: {
-        if (e.IsFeatureEnabled(kX64EmitAVX2)) {
+        if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
+          e.vprolvd(i.dest, i.src1, i.src2);
+        } else if (e.IsFeatureEnabled(kX64EmitAVX2)) {
           Xmm temp = i.dest;
           if (i.dest == i.src1 || i.dest == i.src2) {
             temp = e.xmm2;
@@ -1573,7 +1574,11 @@ EMITTER_OPCODE_TABLE(OPCODE_EXTRACT, EXTRACT_I8, EXTRACT_I16, EXTRACT_I32);
 struct SPLAT_I8 : Sequence<SPLAT_I8, I<OPCODE_SPLAT, V128Op, I8Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.src1.is_constant) {
-      // TODO(benvanik): faster constant splats.
+      if (e.IsFeatureEnabled(kX64EmitGFNI)) {
+        e.pxor(e.xmm0, e.xmm0);
+        e.gf2p8affineqb(i.dest, e.xmm0, i.src1.constant());
+        return;
+      }
       e.mov(e.eax, i.src1.constant());
       e.vmovd(e.xmm0, e.eax);
     } else {

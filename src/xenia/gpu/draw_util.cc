@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2020 Ben Vanik. All rights reserved.                             *
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -63,10 +63,61 @@ bool IsRasterizationPotentiallyDone(const RegisterFile& regs,
   return true;
 }
 
+reg::RB_DEPTHCONTROL GetNormalizedDepthControl(const RegisterFile& regs) {
+  xenos::ModeControl edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  if (edram_mode != xenos::ModeControl::kColorDepth &&
+      edram_mode != xenos::ModeControl::kDepth) {
+    // Both depth and stencil disabled (EDRAM depth and stencil ignored).
+    reg::RB_DEPTHCONTROL disabled;
+    disabled.value = 0;
+    return disabled;
+  }
+  reg::RB_DEPTHCONTROL depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
+  // For more reliable skipping of depth render target management for draws not
+  // requiring depth.
+  if (depthcontrol.z_enable && !depthcontrol.z_write_enable &&
+      depthcontrol.zfunc == xenos::CompareFunction::kAlways) {
+    depthcontrol.z_enable = 0;
+  }
+  // Stencil is more complex and is expected to be usually enabled explicitly
+  // when needed.
+  return depthcontrol;
+}
+
 // https://docs.microsoft.com/en-us/windows/win32/api/d3d11/ne-d3d11-d3d11_standard_multisample_quality_levels
 const int8_t kD3D10StandardSamplePositions2x[2][2] = {{4, 4}, {-4, -4}};
 const int8_t kD3D10StandardSamplePositions4x[4][2] = {
     {-2, -6}, {6, -2}, {-6, 2}, {2, 6}};
+
+void GetPreferredFacePolygonOffset(const RegisterFile& regs,
+                                   bool primitive_polygonal, float& scale_out,
+                                   float& offset_out) {
+  float scale = 0.0f, offset = 0.0f;
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (primitive_polygonal) {
+    // Prefer the front polygon offset because in general, front faces are the
+    // ones that are rendered (except for shadow volumes).
+    if (pa_su_sc_mode_cntl.poly_offset_front_enable &&
+        !pa_su_sc_mode_cntl.cull_front) {
+      scale = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE].f32;
+      offset = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET].f32;
+    }
+    if (pa_su_sc_mode_cntl.poly_offset_back_enable &&
+        !pa_su_sc_mode_cntl.cull_back && !scale && !offset) {
+      scale = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE].f32;
+      offset = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET].f32;
+    }
+  } else {
+    // Non-triangle primitives use the front offset, but it's toggled via
+    // poly_offset_para_enable.
+    if (pa_su_sc_mode_cntl.poly_offset_para_enable) {
+      scale = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE].f32;
+      offset = regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET].f32;
+    }
+  }
+  scale_out = scale;
+  offset_out = offset;
+}
 
 bool IsPixelShaderNeededWithRasterization(const Shader& shader,
                                           const RegisterFile& regs) {
@@ -118,6 +169,7 @@ bool IsPixelShaderNeededWithRasterization(const Shader& shader,
 void GetHostViewportInfo(const RegisterFile& regs, uint32_t resolution_scale_x,
                          uint32_t resolution_scale_y, bool origin_bottom_left,
                          uint32_t x_max, uint32_t y_max, bool allow_reverse_z,
+                         reg::RB_DEPTHCONTROL normalized_depth_control,
                          bool convert_z_to_float24, bool full_float24_in_0_to_1,
                          bool pixel_shader_writes_depth,
                          ViewportInfo& viewport_info_out) {
@@ -467,7 +519,7 @@ void GetHostViewportInfo(const RegisterFile& regs, uint32_t resolution_scale_x,
     }
   }
 
-  if (GetDepthControlForCurrentEdramMode(regs).z_enable &&
+  if (normalized_depth_control.z_enable &&
       regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
           xenos::DepthRenderTargetFormat::kD24FS8) {
     if (convert_z_to_float24) {
@@ -548,6 +600,49 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out,
   scissor_out.offset[1] = uint32_t(tl_y);
   scissor_out.extent[0] = uint32_t(br_x - tl_x);
   scissor_out.extent[1] = uint32_t(br_y - tl_y);
+}
+
+uint32_t GetNormalizedColorMask(const RegisterFile& regs,
+                                uint32_t pixel_shader_writes_color_targets) {
+  if (regs.Get<reg::RB_MODECONTROL>().edram_mode !=
+      xenos::ModeControl::kColorDepth) {
+    return 0;
+  }
+  uint32_t normalized_color_mask = 0;
+  uint32_t rb_color_mask = regs[XE_GPU_REG_RB_COLOR_MASK].u32;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    // Exclude the render targets not statically written to by the pixel shader.
+    // If the shader doesn't write to a render target, it shouldn't be written
+    // to, and no ownership transfers should happen to it on the host even -
+    // otherwise, in 4D5307E6, one render target is being destroyed by a shader
+    // not writing anything, and in 58410955, the result of clearing the top
+    // tile is being ignored because there are 4 render targets bound with the
+    // same EDRAM base (clearly not correct usage), but the shader only clears
+    // 1, and then ownership of EDRAM portions by host render targets is
+    // conflicting.
+    if (!(pixel_shader_writes_color_targets & (uint32_t(1) << i))) {
+      continue;
+    }
+    // Check if any existing component is written to.
+    uint32_t format_component_mask =
+        (uint32_t(1) << xenos::GetColorRenderTargetFormatComponentCount(
+             regs.Get<reg::RB_COLOR_INFO>(
+                     reg::RB_COLOR_INFO::rt_register_indices[i])
+                 .color_format)) -
+        1;
+    uint32_t rt_write_mask = (rb_color_mask >> (4 * i)) & format_component_mask;
+    if (!rt_write_mask) {
+      continue;
+    }
+    // Mark the non-existent components as written so in the host driver, no
+    // slow path (involving reading and merging components) is taken if the
+    // driver doesn't perform this check internally, and some components are not
+    // included in the mask even though they actually don't exist in the format.
+    rt_write_mask |= 0b1111 & ~format_component_mask;
+    // Add to the normalized mask.
+    normalized_color_mask |= rt_write_mask << (4 * i);
+  }
+  return normalized_color_mask;
 }
 
 xenos::CopySampleSelect SanitizeCopySampleSelect(

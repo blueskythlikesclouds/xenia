@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2021 Ben Vanik. All rights reserved.                             *
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -21,8 +21,11 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
+#include "xenia/gpu/draw_extent_estimator.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/register_file.h"
+#include "xenia/gpu/registers.h"
+#include "xenia/gpu/shader.h"
 #include "xenia/gpu/xenos.h"
 
 DECLARE_bool(depth_transfer_not_equal_test);
@@ -215,7 +218,9 @@ class RenderTargetCache {
   virtual void BeginFrame();
 
   virtual bool Update(bool is_rasterization_done,
-                      uint32_t shader_writes_color_targets);
+                      reg::RB_DEPTHCONTROL normalized_depth_control,
+                      uint32_t normalized_color_mask,
+                      const Shader& vertex_shader);
 
   // Returns bits where 0 is whether a depth render target is currently bound on
   // the host and 1... are whether the same applies to color render targets, and
@@ -226,8 +231,10 @@ class RenderTargetCache {
       uint32_t* depth_and_color_formats_out = nullptr) const;
 
  protected:
-  RenderTargetCache(const RegisterFile& register_file)
-      : register_file_(register_file) {}
+  RenderTargetCache(const RegisterFile& register_file, const Memory& memory,
+                    TraceWriter* trace_writer)
+      : register_file_(register_file),
+        draw_extent_estimator_(register_file, memory, trace_writer) {}
 
   const RegisterFile& register_file() const { return register_file_; }
 
@@ -391,6 +398,41 @@ class RenderTargetCache {
                                  const Rectangle* cutout = nullptr);
   };
 
+  union HostDepthStoreRectangleConstant {
+    uint32_t constant;
+    struct {
+      // - 1 because the maximum is 0x1FFF / 8, not 0x2000 / 8.
+      uint32_t x_pixels_div_8 : xenos::kResolveSizeBits - 1 -
+                                xenos::kResolveAlignmentPixelsLog2;
+      uint32_t y_pixels_div_8 : xenos::kResolveSizeBits - 1 -
+                                xenos::kResolveAlignmentPixelsLog2;
+      uint32_t width_pixels_div_8_minus_1 : xenos::kResolveSizeBits - 1 -
+                                            xenos::kResolveAlignmentPixelsLog2;
+    };
+    HostDepthStoreRectangleConstant() : constant(0) {
+      static_assert_size(*this, sizeof(constant));
+    }
+  };
+
+  union HostDepthStoreRenderTargetConstant {
+    uint32_t constant;
+    struct {
+      uint32_t pitch_tiles : xenos::kEdramPitchTilesBits;
+      uint32_t resolution_scale_x : 2;
+      uint32_t resolution_scale_y : 2;
+      // Whether 2x MSAA is supported natively rather than through 4x.
+      uint32_t msaa_2x_supported : 1;
+    };
+    HostDepthStoreRenderTargetConstant() : constant(0) {
+      static_assert_size(*this, sizeof(constant));
+    }
+  };
+
+  struct HostDepthStoreConstants {
+    HostDepthStoreRectangleConstant rectangle;
+    HostDepthStoreRenderTargetConstant render_target;
+  };
+
   struct ResolveCopyDumpRectangle {
     RenderTarget* render_target;
     // If rows == 1:
@@ -511,6 +553,21 @@ class RenderTargetCache {
     return last_update_transfers_;
   }
 
+  HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
+      uint32_t pitch_tiles, bool msaa_2x_supported) const {
+    HostDepthStoreRenderTargetConstant constant;
+    constant.pitch_tiles = pitch_tiles;
+    constant.resolution_scale_x = GetResolutionScaleX();
+    constant.resolution_scale_y = GetResolutionScaleY();
+    constant.msaa_2x_supported = uint32_t(msaa_2x_supported);
+    return constant;
+  }
+  void GetHostDepthStoreRectangleInfo(
+      const Transfer::Rectangle& transfer_rectangle,
+      xenos::MsaaSamples msaa_samples,
+      HostDepthStoreRectangleConstant& rectangle_constant_out,
+      uint32_t& group_count_x_out, uint32_t& group_count_y_out) const;
+
   // Returns mappings between ranges within the specified tile rectangle (not
   // render target texture rectangle - textures may have any pitch they need)
   // from ResolveInfo::GetCopyEdramTileSpan and render targets owning them to
@@ -553,6 +610,8 @@ class RenderTargetCache {
 
  private:
   const RegisterFile& register_file_;
+
+  DrawExtentEstimator draw_extent_estimator_;
 
   // For host render targets.
 
