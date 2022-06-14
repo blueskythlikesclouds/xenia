@@ -14,6 +14,7 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/draw_util.h"
+#include "xenia/gpu/texture_cache.h"
 
 namespace xe {
 namespace gpu {
@@ -172,7 +173,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
   // system_temp_rov_params_.y = Y host pixel position as uint
   in_position_used_ |= 0b0011;
   a_.OpFToU(dxbc::Dest::R(system_temp_rov_params_, 0b0011),
-            dxbc::Src::V(uint32_t(InOutRegister::kPSInPosition)));
+            dxbc::Src::V1D(uint32_t(InOutRegister::kPSInPosition)));
   // Convert the position from pixels to samples.
   // system_temp_rov_params_.x = X sample 0 position
   // system_temp_rov_params_.y = Y sample 0 position
@@ -200,6 +201,10 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
     assert_not_zero(tile_or_half_tile_width_divide_upper_shift);
     --tile_or_half_tile_width_divide_upper_shift;
   }
+  static_assert(
+      TextureCache::kMaxDrawResolutionScaleAlongAxis <= 3,
+      "DxbcShaderTranslator ROV sample address calculation supports Y draw "
+      "resolution scaling factors of only up to 3");
   if (draw_resolution_scale_y_ == 3) {
     // Multiplication part of the division by 40|80 x 16 x scale (specifically
     // 40|80 * scale width here, and 48 height, or 16 * 3 height).
@@ -605,8 +610,8 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     ROV_DepthTo24Bit(system_temp_depth_stencil_, 0, system_temp_depth_stencil_,
                      0, temp, 0);
   } else {
-    dxbc::Src in_position_z(
-        dxbc::Src::V(uint32_t(InOutRegister::kPSInPosition), dxbc::Src::kZZZZ));
+    dxbc::Src in_position_z(dxbc::Src::V1D(
+        uint32_t(InOutRegister::kPSInPosition), dxbc::Src::kZZZZ));
     // Get the derivatives of the screen-space (but not clamped to the viewport
     // depth bounds yet - this happens after the pixel shader in Direct3D 11+;
     // also linear within the triangle - thus constant derivatives along the
@@ -645,9 +650,9 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     a_.OpMax(temp_z_dest, z_ddx_src.Abs(), z_ddy_src.Abs());
     // Calculate the depth bias for the needed faceness.
     in_front_face_used_ = true;
-    a_.OpIf(true,
-            dxbc::Src::V(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
-                         dxbc::Src::kXXXX));
+    a_.OpIf(true, dxbc::Src::V1D(
+                      uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
+                      dxbc::Src::kXXXX));
     // temp.x if early = ddx(z)
     // temp.y if early = ddy(z)
     // temp.z = front face polygon offset
@@ -949,7 +954,7 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
     {
       // Check the current face to get the reference and apply the read mask.
       in_front_face_used_ = true;
-      a_.OpIf(true, dxbc::Src::V(
+      a_.OpIf(true, dxbc::Src::V1D(
                         uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
                         dxbc::Src::kXXXX));
       for (uint32_t j = 0; j < 2; ++j) {
@@ -1012,8 +1017,8 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
       in_front_face_used_ = true;
       a_.OpMovC(
           sample_temp_z_dest,
-          dxbc::Src::V(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
-                       dxbc::Src::kXXXX),
+          dxbc::Src::V1D(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
+                         dxbc::Src::kXXXX),
           LoadSystemConstant(
               SystemConstants::Index::kEdramStencil,
               offsetof(SystemConstants, edram_stencil_front_func_ops),
@@ -1090,18 +1095,18 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
         // Replace.
         a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kReplace)));
         in_front_face_used_ = true;
-        a_.OpMovC(
-            sample_temp_y_dest,
-            dxbc::Src::V(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
-                         dxbc::Src::kXXXX),
-            LoadSystemConstant(
-                SystemConstants::Index::kEdramStencil,
-                offsetof(SystemConstants, edram_stencil_front_reference),
-                dxbc::Src::kXXXX),
-            LoadSystemConstant(
-                SystemConstants::Index::kEdramStencil,
-                offsetof(SystemConstants, edram_stencil_back_reference),
-                dxbc::Src::kXXXX));
+        a_.OpMovC(sample_temp_y_dest,
+                  dxbc::Src::V1D(
+                      uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
+                      dxbc::Src::kXXXX),
+                  LoadSystemConstant(
+                      SystemConstants::Index::kEdramStencil,
+                      offsetof(SystemConstants, edram_stencil_front_reference),
+                      dxbc::Src::kXXXX),
+                  LoadSystemConstant(
+                      SystemConstants::Index::kEdramStencil,
+                      offsetof(SystemConstants, edram_stencil_back_reference),
+                      dxbc::Src::kXXXX));
         a_.OpBreak();
         // Increment and clamp.
         a_.OpCase(dxbc::Src::LU(uint32_t(xenos::StencilOp::kIncrementClamp)));
@@ -1155,8 +1160,8 @@ void DxbcShaderTranslator::ROV_DepthStencilTest() {
       in_front_face_used_ = true;
       a_.OpMovC(
           sample_temp_z_dest,
-          dxbc::Src::V(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
-                       dxbc::Src::kXXXX),
+          dxbc::Src::V1D(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
+                         dxbc::Src::kXXXX),
           LoadSystemConstant(
               SystemConstants::Index::kEdramStencil,
               offsetof(SystemConstants, edram_stencil_front_write_mask),
@@ -1379,8 +1384,8 @@ void DxbcShaderTranslator::ROV_UnpackColor(
              dxbc::Src::LF(1.0f / 255.0f));
     if (i) {
       for (uint32_t j = 0; j < 3; ++j) {
-        ConvertPWLGamma(false, color_temp, j, color_temp, j, temp1,
-                        temp1_component, temp2, temp2_component);
+        PWLGammaToLinear(color_temp, j, color_temp, j, true, temp1,
+                         temp1_component, temp2, temp2_component);
       }
     }
     a_.OpBreak();
@@ -1532,8 +1537,9 @@ void DxbcShaderTranslator::ROV_PackPreClampedColor(
           : xenos::ColorRenderTargetFormat::k_8_8_8_8)));
     for (uint32_t j = 0; j < 4; ++j) {
       if (i && j < 3) {
-        ConvertPWLGamma(true, color_temp, j, temp1, temp1_component, temp1,
-                        temp1_component, temp2, temp2_component);
+        PreSaturatedLinearToPWLGamma(temp1, temp1_component, color_temp, j,
+                                     temp1, temp1_component, temp2,
+                                     temp2_component);
         // Denormalize and add 0.5 for rounding.
         a_.OpMAd(temp1_dest, temp1_src, dxbc::Src::LF(255.0f),
                  dxbc::Src::LF(0.5f));
@@ -1858,10 +1864,10 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
     if (!(shader_writes_color_targets & (1 << i))) {
       continue;
     }
+    uint32_t system_temp_color = system_temps_color_[i];
     // Apply the exponent bias after alpha to coverage because it needs the
-    // unbiased alpha from the shader
-    a_.OpMul(dxbc::Dest::R(system_temps_color_[i]),
-             dxbc::Src::R(system_temps_color_[i]),
+    // unbiased alpha from the shader.
+    a_.OpMul(dxbc::Dest::R(system_temp_color), dxbc::Src::R(system_temp_color),
              LoadSystemConstant(
                  SystemConstants::Index::kColorExpBias,
                  offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
@@ -1873,14 +1879,17 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
       a_.OpAnd(dxbc::Dest::R(gamma_temp, 0b0001), LoadFlagsSystemConstant(),
                dxbc::Src::LU(kSysFlag_ConvertColor0ToGamma << i));
       a_.OpIf(true, dxbc::Src::R(gamma_temp, dxbc::Src::kXXXX));
+      // Saturate before the gamma conversion.
+      a_.OpMov(dxbc::Dest::R(system_temp_color, 0b0111),
+               dxbc::Src::R(system_temp_color), true);
       for (uint32_t j = 0; j < 3; ++j) {
-        ConvertPWLGamma(true, system_temps_color_[i], j, system_temps_color_[i],
-                        j, gamma_temp, 0, gamma_temp, 1);
+        PreSaturatedLinearToPWLGamma(system_temp_color, j, system_temp_color, j,
+                                     gamma_temp, 0, gamma_temp, 1);
       }
       a_.OpEndIf();
     }
     // Copy the color from a readable temp register to an output register.
-    a_.OpMov(dxbc::Dest::O(i), dxbc::Src::R(system_temps_color_[i]));
+    a_.OpMov(dxbc::Dest::O(i), dxbc::Src::R(system_temp_color));
   }
   // Release gamma_temp.
   PopSystemTemp();
@@ -1924,10 +1933,10 @@ void DxbcShaderTranslator::CompletePixelShader_DSV_DepthTo24Bit() {
     // assumption of it being clamped while working with the bit representation.
     temp = PushSystemTemp();
     in_position_used_ |= 0b0100;
-    a_.OpMul(
-        dxbc::Dest::R(temp, 0b0001),
-        dxbc::Src::V(uint32_t(InOutRegister::kPSInPosition), dxbc::Src::kZZZZ),
-        dxbc::Src::LF(2.0f), true);
+    a_.OpMul(dxbc::Dest::R(temp, 0b0001),
+             dxbc::Src::V1D(uint32_t(InOutRegister::kPSInPosition),
+                            dxbc::Src::kZZZZ),
+             dxbc::Src::LF(2.0f), true);
   }
 
   dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
@@ -2068,7 +2077,7 @@ void DxbcShaderTranslator::CompletePixelShader_AlphaToMask() {
   // temp.x = alpha to coverage offset as float 0.0...3.0.
   in_position_used_ |= 0b0011;
   a_.OpFToU(dxbc::Dest::R(temp, 0b0011),
-            dxbc::Src::V(uint32_t(InOutRegister::kPSInPosition)));
+            dxbc::Src::V1D(uint32_t(InOutRegister::kPSInPosition)));
   a_.OpAnd(dxbc::Dest::R(temp, 0b0010), dxbc::Src::R(temp, dxbc::Src::kYYYY),
            dxbc::Src::LU(1));
   a_.OpBFI(temp_x_dest, dxbc::Src::LU(1), dxbc::Src::LU(1), temp_x_src,

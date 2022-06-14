@@ -95,8 +95,8 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  texture_cache_ = std::make_unique<TextureCache>(memory_, register_file_,
-                                                  &trace_writer_, provider);
+  texture_cache_ = std::make_unique<VulkanTextureCache>(
+      memory_, register_file_, &trace_writer_, provider);
   status = texture_cache_->Initialize();
   if (status != VK_SUCCESS) {
     XELOGE("Unable to initialize texture cache");
@@ -104,7 +104,8 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
 
-  pipeline_cache_ = std::make_unique<PipelineCache>(register_file_, provider);
+  pipeline_cache_ =
+      std::make_unique<VulkanPipelineCache>(register_file_, provider);
   status = pipeline_cache_->Initialize(
       buffer_cache_->constant_descriptor_set_layout(),
       texture_cache_->texture_descriptor_set_layout(),
@@ -191,20 +192,6 @@ void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     offset ^= 0x1F;
 
     dirty_loop_constants_ |= (1 << offset);
-  } else if (index == XE_GPU_REG_DC_LUT_PWL_DATA) {
-    UpdateGammaRampValue(GammaRampType::kPWL, value);
-  } else if (index == XE_GPU_REG_DC_LUT_30_COLOR) {
-    UpdateGammaRampValue(GammaRampType::kTable, value);
-  } else if (index >= XE_GPU_REG_DC_LUT_RW_MODE &&
-             index <= XE_GPU_REG_DC_LUTA_CONTROL) {
-    uint32_t offset = index - XE_GPU_REG_DC_LUT_RW_MODE;
-    offset ^= 0x05;
-
-    dirty_gamma_constants_ |= (1 << offset);
-
-    if (index == XE_GPU_REG_DC_LUT_RW_INDEX) {
-      gamma_ramp_rw_subindex_ = 0;
-    }
   }
 }
 
@@ -728,9 +715,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   auto pipeline_status = pipeline_cache_->ConfigurePipeline(
       command_buffer, current_render_state_, vertex_shader, pixel_shader,
       primitive_type, &pipeline);
-  if (pipeline_status == PipelineCache::UpdateStatus::kError) {
+  if (pipeline_status == VulkanPipelineCache::UpdateStatus::kError) {
     return false;
-  } else if (pipeline_status == PipelineCache::UpdateStatus::kMismatch ||
+  } else if (pipeline_status == VulkanPipelineCache::UpdateStatus::kMismatch ||
              full_update) {
     dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           pipeline);
@@ -1399,8 +1386,6 @@ bool VulkanCommandProcessor::IssueCopy() {
 
   return true;
 }
-
-void VulkanCommandProcessor::InitializeTrace() {}
 
 }  // namespace vulkan
 }  // namespace gpu

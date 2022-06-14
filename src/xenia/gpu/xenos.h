@@ -248,6 +248,7 @@ enum class MsaaSamples : uint32_t {
 
 constexpr uint32_t kMsaaSamplesBits = 2;
 
+constexpr uint32_t kColorRenderTargetIndexBits = 2;
 constexpr uint32_t kMaxColorRenderTargets = 4;
 
 enum class ColorRenderTargetFormat : uint32_t {
@@ -325,6 +326,9 @@ enum class DepthRenderTargetFormat : uint32_t {
 };
 
 const char* GetDepthRenderTargetFormatName(DepthRenderTargetFormat format);
+
+float PWLGammaToLinear(float gamma);
+float LinearToPWLGamma(float linear);
 
 // Converts Xenos floating-point 7e3 color value in bits 0:9 (not clamping) to
 // an IEEE-754 32-bit floating-point number.
@@ -410,7 +414,14 @@ enum class TextureFormat : uint32_t {
   k_8_A = 8,
   k_8_B = 9,
   k_8_8 = 10,
+  // Though it's unknown what exactly REP means, likely it's "repeating
+  // fraction" (the term used for normalized fixed-point formats, UNORM in
+  // particular for unsigned signedness - 0.0 to 1.0 range, like in
+  // Direct3D 10+, unlike the 0.0 to 255.0 range for D3DFMT_R8G8_B8G8 and
+  // D3DFMT_G8R8_G8B8 in Direct3D 9). 54540829 uses k_Y1_Cr_Y0_Cb_REP directly
+  // as UNORM.
   k_Cr_Y1_Cb_Y0_REP = 11,
+  // Used for videos in 54540829.
   k_Y1_Cr_Y0_Cb_REP = 12,
   k_16_16_EDRAM = 13,
   k_8_8_8_8_A = 14,
@@ -904,29 +915,28 @@ constexpr bool IsSingleCopySampleSelected(CopySampleSelect copy_sample_select) {
          copy_sample_select <= CopySampleSelect::k3;
 }
 
-#define XE_GPU_MAKE_SWIZZLE(x, y, z, w)                        \
-  (((XE_GPU_SWIZZLE_##x) << 0) | ((XE_GPU_SWIZZLE_##y) << 3) | \
-   ((XE_GPU_SWIZZLE_##z) << 6) | ((XE_GPU_SWIZZLE_##w) << 9))
+#define XE_GPU_MAKE_TEXTURE_SWIZZLE(x, y, z, w)          \
+  (((xe::gpu::xenos::XE_GPU_TEXTURE_SWIZZLE_##x) << 0) | \
+   ((xe::gpu::xenos::XE_GPU_TEXTURE_SWIZZLE_##y) << 3) | \
+   ((xe::gpu::xenos::XE_GPU_TEXTURE_SWIZZLE_##z) << 6) | \
+   ((xe::gpu::xenos::XE_GPU_TEXTURE_SWIZZLE_##w) << 9))
 typedef enum {
-  XE_GPU_SWIZZLE_X = 0,
-  XE_GPU_SWIZZLE_R = 0,
-  XE_GPU_SWIZZLE_Y = 1,
-  XE_GPU_SWIZZLE_G = 1,
-  XE_GPU_SWIZZLE_Z = 2,
-  XE_GPU_SWIZZLE_B = 2,
-  XE_GPU_SWIZZLE_W = 3,
-  XE_GPU_SWIZZLE_A = 3,
-  XE_GPU_SWIZZLE_0 = 4,
-  XE_GPU_SWIZZLE_1 = 5,
-  XE_GPU_SWIZZLE_RGBA = XE_GPU_MAKE_SWIZZLE(R, G, B, A),
-  XE_GPU_SWIZZLE_BGRA = XE_GPU_MAKE_SWIZZLE(B, G, R, A),
-  XE_GPU_SWIZZLE_RGB1 = XE_GPU_MAKE_SWIZZLE(R, G, B, 1),
-  XE_GPU_SWIZZLE_BGR1 = XE_GPU_MAKE_SWIZZLE(B, G, R, 1),
-  XE_GPU_SWIZZLE_000R = XE_GPU_MAKE_SWIZZLE(0, 0, 0, R),
-  XE_GPU_SWIZZLE_RRR1 = XE_GPU_MAKE_SWIZZLE(R, R, R, 1),
-  XE_GPU_SWIZZLE_R111 = XE_GPU_MAKE_SWIZZLE(R, 1, 1, 1),
-  XE_GPU_SWIZZLE_R000 = XE_GPU_MAKE_SWIZZLE(R, 0, 0, 0),
-} XE_GPU_SWIZZLE;
+  XE_GPU_TEXTURE_SWIZZLE_X = 0,
+  XE_GPU_TEXTURE_SWIZZLE_R = 0,
+  XE_GPU_TEXTURE_SWIZZLE_Y = 1,
+  XE_GPU_TEXTURE_SWIZZLE_G = 1,
+  XE_GPU_TEXTURE_SWIZZLE_Z = 2,
+  XE_GPU_TEXTURE_SWIZZLE_B = 2,
+  XE_GPU_TEXTURE_SWIZZLE_W = 3,
+  XE_GPU_TEXTURE_SWIZZLE_A = 3,
+  XE_GPU_TEXTURE_SWIZZLE_0 = 4,
+  XE_GPU_TEXTURE_SWIZZLE_1 = 5,
+  XE_GPU_TEXTURE_SWIZZLE_RRRR = XE_GPU_MAKE_TEXTURE_SWIZZLE(R, R, R, R),
+  XE_GPU_TEXTURE_SWIZZLE_RGGG = XE_GPU_MAKE_TEXTURE_SWIZZLE(R, G, G, G),
+  XE_GPU_TEXTURE_SWIZZLE_RGBB = XE_GPU_MAKE_TEXTURE_SWIZZLE(R, G, B, B),
+  XE_GPU_TEXTURE_SWIZZLE_RGBA = XE_GPU_MAKE_TEXTURE_SWIZZLE(R, G, B, A),
+  XE_GPU_TEXTURE_SWIZZLE_0000 = XE_GPU_MAKE_TEXTURE_SWIZZLE(0, 0, 0, 0),
+} XE_GPU_TEXTURE_SWIZZLE;
 
 inline uint16_t GpuSwap(uint16_t value, Endian endianness) {
   switch (endianness) {
@@ -998,6 +1008,9 @@ enum class FetchConstantType : uint32_t {
   kVertex,
 };
 
+constexpr uint32_t kTextureFetchConstantCount = 32;
+constexpr uint32_t kVertexFetchConstantCount = 3 * kTextureFetchConstantCount;
+
 // XE_GPU_REG_SHADER_CONSTANT_FETCH_*
 union alignas(uint32_t) xe_gpu_vertex_fetch_t {
   struct {
@@ -1035,19 +1048,31 @@ constexpr uint32_t kTexture3DMaxWidthHeight = 1 << kTexture3DMaxWidthHeightLog2;
 constexpr uint32_t kTexture3DMaxDepthLog2 = 10;
 constexpr uint32_t kTexture3DMaxDepth = 1 << kTexture3DMaxDepthLog2;
 
-// Tiled texture sizes are in 32x32 increments for 2D, 32x32x4 for 3D.
-// 2DTiledOffset(X * 32 + x, Y * 32 + y) ==
-//     2DTiledOffset(X * 32, Y * 32) + 2DTiledOffset(x, y)
-// 3DTiledOffset(X * 32 + x, Y * 32 + y, Z * 8 + z) ==
-//     3DTiledOffset(X * 32, Y * 32, Z * 8) + 3DTiledOffset(x, y, z)
-// Both are true for negative offsets too.
+constexpr uint32_t kTextureMaxMips =
+    std::max(kTexture2DCubeMaxWidthHeightLog2, kTexture3DMaxWidthHeightLog2) +
+    1;
+
 constexpr uint32_t kTextureTileWidthHeightLog2 = 5;
 constexpr uint32_t kTextureTileWidthHeight = 1 << kTextureTileWidthHeightLog2;
 // 3D tiled texture slices 0:3 and 4:7 are stored separately in memory, in
 // non-overlapping ranges, but addressing in 4:7 is different than in 0:3.
-constexpr uint32_t kTextureTiledDepthGranularityLog2 = 2;
-constexpr uint32_t kTextureTiledDepthGranularity =
-    1 << kTextureTiledDepthGranularityLog2;
+constexpr uint32_t kTextureTileDepthLog2 = 2;
+constexpr uint32_t kTextureTileDepth = 1 << kTextureTileDepthLog2;
+
+// Texture tile address function periods:
+// - 2D 1bpb: 128x128
+// - 2D 2bpb: 64x64
+// - 2D 4bpb+: 32x32
+// - 3D 1bpb: 64x32x8
+// - 3D 2bpb+: 32x32x8
+constexpr uint32_t GetTextureTiledXBaseGranularityLog2(
+    bool is_3d, uint32_t bytes_per_block_log2) {
+  return 7 - std::min(UINT32_C(2), bytes_per_block_log2 + uint32_t(is_3d));
+}
+constexpr uint32_t GetTextureTiledYBaseGranularityLog2(
+    bool is_3d, uint32_t bytes_per_block_log2) {
+  return is_3d ? 5 : (7 - std::min(UINT32_C(2), bytes_per_block_log2));
+}
 constexpr uint32_t kTextureTiledZBaseGranularityLog2 = 3;
 constexpr uint32_t kTextureTiledZBaseGranularity =
     1 << kTextureTiledZBaseGranularityLog2;
@@ -1127,7 +1152,7 @@ union alignas(uint32_t) xe_gpu_texture_fetch_t {
     };
 
     uint32_t num_format : 1;  // +0 dword_3 frac/int
-    // xyzw, 3b each (XE_GPU_SWIZZLE)
+    // xyzw, 3b each (XE_GPU_TEXTURE_SWIZZLE)
     uint32_t swizzle : 12;                 // +1
     int32_t exp_adjust : 6;                // +13
     TextureFilter mag_filter : 2;          // +19

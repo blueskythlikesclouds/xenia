@@ -81,10 +81,8 @@ DxbcShaderTranslator::DxbcShaderTranslator(
       draw_resolution_scale_x_(draw_resolution_scale_x),
       draw_resolution_scale_y_(draw_resolution_scale_y),
       emit_source_map_(force_emit_source_map || cvars::dxbc_source_map) {
-  assert_true(draw_resolution_scale_x >= 1);
-  assert_true(draw_resolution_scale_x <= 3);
-  assert_true(draw_resolution_scale_y >= 1);
-  assert_true(draw_resolution_scale_y <= 3);
+  assert_not_zero(draw_resolution_scale_x);
+  assert_not_zero(draw_resolution_scale_y);
   // Don't allocate again and again for the first shader.
   shader_code_.reserve(8192);
   shader_object_.reserve(16384);
@@ -214,63 +212,124 @@ void DxbcShaderTranslator::PopSystemTemp(uint32_t count) {
   system_temp_count_current_ -= std::min(count, system_temp_count_current_);
 }
 
-void DxbcShaderTranslator::ConvertPWLGamma(
-    bool to_gamma, int32_t source_temp, uint32_t source_temp_component,
-    uint32_t target_temp, uint32_t target_temp_component, uint32_t piece_temp,
-    uint32_t piece_temp_component, uint32_t accumulator_temp,
-    uint32_t accumulator_temp_component) {
-  assert_true(source_temp != target_temp ||
-              source_temp_component != target_temp_component ||
-              ((target_temp != accumulator_temp ||
-                target_temp_component != accumulator_temp_component) &&
-               (target_temp != piece_temp ||
-                target_temp_component != piece_temp_component)));
-  assert_true(piece_temp != source_temp ||
-              piece_temp_component != source_temp_component);
-  assert_true(accumulator_temp != source_temp ||
-              accumulator_temp_component != source_temp_component);
-  assert_true(piece_temp != accumulator_temp ||
-              piece_temp_component != accumulator_temp_component);
+void DxbcShaderTranslator::PWLGammaToLinear(
+    uint32_t target_temp, uint32_t target_temp_component, uint32_t source_temp,
+    uint32_t source_temp_component, bool source_pre_saturated, uint32_t temp1,
+    uint32_t temp1_component, uint32_t temp2, uint32_t temp2_component) {
+  // The source is needed only once to begin building the result, so it can be
+  // the same as the destination.
+  assert_true(temp1 != target_temp || temp1_component != target_temp_component);
+  assert_true(temp1 != source_temp || temp1_component != source_temp_component);
+  assert_true(temp2 != target_temp || temp2_component != target_temp_component);
+  assert_true(temp2 != source_temp || temp2_component != source_temp_component);
+  assert_true(temp1 != temp2 || temp1_component != temp2_component);
+  dxbc::Dest target_dest(
+      dxbc::Dest::R(target_temp, UINT32_C(1) << target_temp_component));
+  dxbc::Src target_src(dxbc::Src::R(target_temp).Select(target_temp_component));
   dxbc::Src source_src(dxbc::Src::R(source_temp).Select(source_temp_component));
-  dxbc::Dest piece_dest(dxbc::Dest::R(piece_temp, 1 << piece_temp_component));
-  dxbc::Src piece_src(dxbc::Src::R(piece_temp).Select(piece_temp_component));
-  dxbc::Dest accumulator_dest(
-      dxbc::Dest::R(accumulator_temp, 1 << accumulator_temp_component));
-  dxbc::Src accumulator_src(
-      dxbc::Src::R(accumulator_temp).Select(accumulator_temp_component));
-  // For each piece:
-  // 1) Calculate how far we are on it. Multiply by 1/width, subtract
-  //    start/width and saturate.
-  // 2) Add the contribution of the piece - multiply the position on the piece
-  //    by its slope*width and accumulate.
-  // Piece 1.
-  a_.OpMul(piece_dest, source_src,
-           dxbc::Src::LF(to_gamma ? (1.0f / 0.0625f) : (1.0f / 0.25f)), true);
-  a_.OpMul(accumulator_dest, piece_src,
-           dxbc::Src::LF(to_gamma ? (4.0f * 0.0625f) : (0.25f * 0.25f)));
-  // Piece 2.
-  a_.OpMAd(piece_dest, source_src,
-           dxbc::Src::LF(to_gamma ? (1.0f / 0.0625f) : (1.0f / 0.125f)),
-           dxbc::Src::LF(to_gamma ? (-0.0625f / 0.0625f) : (-0.25f / 0.125f)),
-           true);
-  a_.OpMAd(accumulator_dest, piece_src,
-           dxbc::Src::LF(to_gamma ? (2.0f * 0.0625f) : (0.5f * 0.125f)),
-           accumulator_src);
-  // Piece 3.
-  a_.OpMAd(piece_dest, source_src,
-           dxbc::Src::LF(to_gamma ? (1.0f / 0.375f) : (1.0f / 0.375f)),
-           dxbc::Src::LF(to_gamma ? (-0.125f / 0.375f) : (-0.375f / 0.375f)),
-           true);
-  a_.OpMAd(accumulator_dest, piece_src,
-           dxbc::Src::LF(to_gamma ? (1.0f * 0.375f) : (1.0f * 0.375f)),
-           accumulator_src);
-  // Piece 4.
-  a_.OpMAd(piece_dest, source_src,
-           dxbc::Src::LF(to_gamma ? (1.0f / 0.5f) : (1.0f / 0.25f)),
-           dxbc::Src::LF(to_gamma ? (-0.5f / 0.5f) : (-0.75f / 0.25f)), true);
-  a_.OpMAd(dxbc::Dest::R(target_temp, 1 << target_temp_component), piece_src,
-           dxbc::Src::LF(to_gamma ? (0.5f * 0.5f) : (2.0f * 0.25f)),
-           accumulator_src);
+  dxbc::Dest temp1_dest(dxbc::Dest::R(temp1, UINT32_C(1) << temp1_component));
+  dxbc::Src temp1_src(dxbc::Src::R(temp1).Select(temp1_component));
+  dxbc::Dest temp2_dest(dxbc::Dest::R(temp2, UINT32_C(1) << temp2_component));
+  dxbc::Src temp2_src(dxbc::Src::R(temp2).Select(temp2_component));
+
+  // Get the scale (into temp1) and the offset (into temp2) for the piece.
+  // Using `source >= threshold` comparisons because the input might have not
+  // been saturated yet, and thus it may be NaN - since it will be saturated to
+  // 0 later, the 0...64/255 case should be selected for it.
+  a_.OpGE(temp2_dest, source_src, dxbc::Src::LF(96.0f / 255.0f));
+  a_.OpIf(true, temp2_src);
+  // [96/255 ... 1
+  a_.OpGE(temp2_dest, source_src, dxbc::Src::LF(192.0f / 255.0f));
+  a_.OpMovC(temp1_dest, temp2_src, dxbc::Src::LF(8.0f / 1024.0f),
+            dxbc::Src::LF(4.0f / 1024.0f));
+  a_.OpMovC(temp2_dest, temp2_src, dxbc::Src::LF(-1024.0f),
+            dxbc::Src::LF(-256.0f));
+  a_.OpElse();
+  // 0 ... 96/255)
+  a_.OpGE(temp2_dest, source_src, dxbc::Src::LF(64.0f / 255.0f));
+  a_.OpMovC(temp1_dest, temp2_src, dxbc::Src::LF(2.0f / 1024.0f),
+            dxbc::Src::LF(1.0f / 1024.0f));
+  a_.OpMovC(temp2_dest, temp2_src, dxbc::Src::LF(-64.0f), dxbc::Src::LF(0.0f));
+  a_.OpEndIf();
+
+  if (!source_pre_saturated) {
+    // Saturate the input, and flush NaN to 0.
+    a_.OpMov(target_dest, source_src, true);
+  }
+  // linear = gamma * (255 * 1024) * scale + offset
+  // As both 1024 and the scale are powers of 2, and 1024 * scale is not smaller
+  // than 1, it's not important if it's (gamma * 255) * 1024 * scale,
+  // (gamma * 255 * 1024) * scale, gamma * 255 * (1024 * scale), or
+  // gamma * (255 * 1024 * scale) - or the option chosen here, as long as
+  // 1024 is applied before the scale since the scale is < 1 (specifically at
+  // least 1/1024), and it may make very small values denormal.
+  a_.OpMul(target_dest, source_pre_saturated ? source_src : target_src,
+           dxbc::Src::LF(255.0f * 1024.0f));
+  a_.OpMAd(target_dest, target_src, temp1_src, temp2_src);
+  // linear += trunc(linear * scale)
+  a_.OpMul(temp1_dest, target_src, temp1_src);
+  a_.OpRoundZ(temp1_dest, temp1_src);
+  a_.OpAdd(target_dest, target_src, temp1_src);
+  // linear *= 1/1023
+  a_.OpMul(target_dest, target_src, dxbc::Src::LF(1.0f / 1023.0f));
+}
+
+void DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(
+    uint32_t target_temp, uint32_t target_temp_component, uint32_t source_temp,
+    uint32_t source_temp_component, uint32_t temp_or_target,
+    uint32_t temp_or_target_component, uint32_t temp_non_target,
+    uint32_t temp_non_target_component) {
+  // The source may be the same as the target, but in this case it can't also be
+  // used as a temporary variable.
+  assert_true(target_temp != source_temp ||
+              target_temp_component != source_temp_component ||
+              target_temp != temp_or_target ||
+              target_temp_component != temp_or_target_component);
+  assert_true(temp_or_target != source_temp ||
+              temp_or_target_component != source_temp_component);
+  assert_true(temp_non_target != target_temp ||
+              temp_non_target_component != target_temp_component);
+  assert_true(temp_non_target != source_temp ||
+              temp_non_target_component != source_temp_component);
+  assert_true(temp_or_target != temp_non_target ||
+              temp_or_target_component != temp_non_target_component);
+  dxbc::Dest target_dest(
+      dxbc::Dest::R(target_temp, UINT32_C(1) << target_temp_component));
+  dxbc::Src target_src(dxbc::Src::R(target_temp).Select(target_temp_component));
+  dxbc::Src source_src(dxbc::Src::R(source_temp).Select(source_temp_component));
+  dxbc::Dest temp_or_target_dest(
+      dxbc::Dest::R(temp_or_target, UINT32_C(1) << temp_or_target_component));
+  dxbc::Src temp_or_target_src(
+      dxbc::Src::R(temp_or_target).Select(temp_or_target_component));
+  dxbc::Dest temp_non_target_dest(
+      dxbc::Dest::R(temp_non_target, UINT32_C(1) << temp_non_target_component));
+  dxbc::Src temp_non_target_src(
+      dxbc::Src::R(temp_non_target).Select(temp_non_target_component));
+
+  // Get the scale (into temp_or_target) and the offset (into temp_non_target)
+  // for the piece.
+  a_.OpGE(temp_non_target_dest, source_src, dxbc::Src::LF(128.0f / 1023.0f));
+  a_.OpIf(true, temp_non_target_src);
+  // [128/1023 ... 1
+  a_.OpGE(temp_non_target_dest, source_src, dxbc::Src::LF(512.0f / 1023.0f));
+  a_.OpMovC(temp_or_target_dest, temp_non_target_src,
+            dxbc::Src::LF(1023.0f / 8.0f), dxbc::Src::LF(1023.0f / 4.0f));
+  a_.OpMovC(temp_non_target_dest, temp_non_target_src,
+            dxbc::Src::LF(128.0f / 255.0f), dxbc::Src::LF(64.0f / 255.0f));
+  a_.OpElse();
+  // 0 ... 128/1023)
+  a_.OpGE(temp_non_target_dest, source_src, dxbc::Src::LF(64.0f / 1023.0f));
+  a_.OpMovC(temp_or_target_dest, temp_non_target_src,
+            dxbc::Src::LF(1023.0f / 2.0f), dxbc::Src::LF(1023.0f));
+  a_.OpMovC(temp_non_target_dest, temp_non_target_src,
+            dxbc::Src::LF(32.0f / 255.0f), dxbc::Src::LF(0.0f));
+  a_.OpEndIf();
+
+  // gamma = trunc(linear * scale) * (1.0 / 255.0) + offset
+  a_.OpMul(target_dest, source_src, temp_or_target_src);
+  a_.OpRoundZ(target_dest, target_src);
+  a_.OpMAd(target_dest, target_src, dxbc::Src::LF(1.0f / 255.0f),
+           temp_non_target_src);
 }
 
 void DxbcShaderTranslator::RemapAndConvertVertexIndices(
@@ -326,16 +385,17 @@ void DxbcShaderTranslator::StartVertexShader_LoadVertexIndex() {
   // Check if the closing vertex of a non-indexed line loop is being processed.
   a_.OpINE(
       index_dest,
-      dxbc::Src::V(uint32_t(InOutRegister::kVSInVertexIndex), dxbc::Src::kXXXX),
+      dxbc::Src::V1D(uint32_t(InOutRegister::kVSInVertexIndex),
+                     dxbc::Src::kXXXX),
       LoadSystemConstant(SystemConstants::Index::kLineLoopClosingIndex,
                          offsetof(SystemConstants, line_loop_closing_index),
                          dxbc::Src::kXXXX));
   // Zero the index if processing the closing vertex of a line loop, or do
   // nothing (replace 0 with 0) if not needed.
-  a_.OpAnd(
-      index_dest,
-      dxbc::Src::V(uint32_t(InOutRegister::kVSInVertexIndex), dxbc::Src::kXXXX),
-      index_src);
+  a_.OpAnd(index_dest,
+           dxbc::Src::V1D(uint32_t(InOutRegister::kVSInVertexIndex),
+                          dxbc::Src::kXXXX),
+           index_src);
 
   {
     // Swap the vertex index's endianness.
@@ -590,7 +650,7 @@ void DxbcShaderTranslator::StartPixelShader() {
         // system_temp_depth_stencil_ before any return statement is possibly
         // reached.
         assert_true(system_temp_depth_stencil_ != UINT32_MAX);
-        dxbc::Src in_position_z(dxbc::Src::V(
+        dxbc::Src in_position_z(dxbc::Src::V1D(
             uint32_t(InOutRegister::kPSInPosition), dxbc::Src::kZZZZ));
         in_position_used_ |= 0b0100;
         a_.OpDerivRTXCoarse(dxbc::Dest::R(system_temp_depth_stencil_, 0b0001),
@@ -633,14 +693,14 @@ void DxbcShaderTranslator::StartPixelShader() {
       // At center.
       a_.OpMov(uses_register_dynamic_addressing ? dxbc::Dest::X(0, i)
                                                 : dxbc::Dest::R(i),
-               dxbc::Src::V(uint32_t(InOutRegister::kPSInInterpolators) + i));
+               dxbc::Src::V1D(uint32_t(InOutRegister::kPSInInterpolators) + i));
       a_.OpElse();
       // At centroid. Not really important that 2x MSAA is emulated using
       // ForcedSampleCount 4 - what matters is that the sample position will
       // be within the primitive, and the value will not be extrapolated.
       a_.OpEvalCentroid(
           dxbc::Dest::R(centroid_register),
-          dxbc::Src::V(uint32_t(InOutRegister::kPSInInterpolators) + i));
+          dxbc::Src::V1D(uint32_t(InOutRegister::kPSInInterpolators) + i));
       if (uses_register_dynamic_addressing) {
         a_.OpMov(dxbc::Dest::X(0, i), dxbc::Src::R(centroid_register));
       }
@@ -663,7 +723,11 @@ void DxbcShaderTranslator::StartPixelShader() {
     a_.OpIf(true, dxbc::Src::R(param_gen_temp, dxbc::Src::kXXXX));
     {
       // XY - floored pixel position (Direct3D VPOS) in the absolute value,
-      // faceness as X sign bit. Using Z as scratch register now.
+      // faceness as X sign bit, whether is a point primitive as Y sign bit.
+      // Using Z as scratch register now.
+      // ZW - [0, 1] UV within a point sprite in the absolute value, whether is
+      // a line primitive as Z sign bit.
+      // Pixel position.
       // Get XY address of the current host pixel as float (no matter whether
       // the position is pixel-rate or sample-rate also due to float24 depth
       // conversion requirements, it will be rounded the same). Rounding down,
@@ -673,7 +737,7 @@ void DxbcShaderTranslator::StartPixelShader() {
       // have correct derivative magnitude and LODs.
       in_position_used_ |= 0b0011;
       a_.OpRoundNI(dxbc::Dest::R(param_gen_temp, 0b0011),
-                   dxbc::Src::V(uint32_t(InOutRegister::kPSInPosition)));
+                   dxbc::Src::V1D(uint32_t(InOutRegister::kPSInPosition)));
       uint32_t resolution_scaled_axes =
           uint32_t(draw_resolution_scale_x_ > 1) |
           (uint32_t(draw_resolution_scale_y_ > 1) << 1);
@@ -688,6 +752,7 @@ void DxbcShaderTranslator::StartPixelShader() {
       }
       a_.OpMov(dxbc::Dest::R(param_gen_temp, 0b0011),
                dxbc::Src::R(param_gen_temp).Abs());
+      // Faceness.
       // Check if faceness applies to the current primitive type.
       a_.OpAnd(dxbc::Dest::R(param_gen_temp, 0b0100), LoadFlagsSystemConstant(),
                dxbc::Src::LU(kSysFlag_PrimitivePolygonal));
@@ -696,39 +761,36 @@ void DxbcShaderTranslator::StartPixelShader() {
         // Negate modifier flips the sign bit even for 0 - set it to minus for
         // backfaces.
         in_front_face_used_ = true;
-        a_.OpMovC(
-            dxbc::Dest::R(param_gen_temp, 0b0001),
-            dxbc::Src::V(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
-                         dxbc::Src::kXXXX),
-            dxbc::Src::R(param_gen_temp, dxbc::Src::kXXXX),
-            -dxbc::Src::R(param_gen_temp, dxbc::Src::kXXXX));
+        a_.OpMovC(dxbc::Dest::R(param_gen_temp, 0b0001),
+                  dxbc::Src::V1D(
+                      uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
+                      dxbc::Src::kXXXX),
+                  dxbc::Src::R(param_gen_temp, dxbc::Src::kXXXX),
+                  -dxbc::Src::R(param_gen_temp, dxbc::Src::kXXXX));
       }
       a_.OpEndIf();
-      // ZW - UV within a point sprite in the absolute value, at centroid if
-      // requested for the interpolator.
-      // TODO(Triang3l): Are centroid point coordinates possible in the hardware
-      // at all? ps_param_gen is not a triangle-IJ-interpolated value
-      // apparently, rather, it replaces the value in the shader input.
-      // TODO(Triang3l): Saturate to avoid negative point coordinates (the sign
-      // bit is used for the primitive type indicator) in case of extrapolation
-      // when the center is not covered with MSAA.
-      dxbc::Dest point_coord_r_zw_dest(dxbc::Dest::R(param_gen_temp, 0b1100));
-      dxbc::Src point_coord_v_xxxy_src(dxbc::Src::V(
-          uint32_t(InOutRegister::kPSInPointParameters), 0b01000000));
-      a_.OpUBFE(dxbc::Dest::R(param_gen_temp, 0b0100), dxbc::Src::LU(1),
-                param_gen_index_src,
-                LoadSystemConstant(
-                    SystemConstants::Index::kInterpolatorSamplingPattern,
-                    offsetof(SystemConstants, interpolator_sampling_pattern),
-                    dxbc::Src::kXXXX));
-      a_.OpIf(bool(xenos::SampleLocation::kCenter),
-              dxbc::Src::R(param_gen_temp, dxbc::Src::kZZZZ));
-      // At center.
-      a_.OpMov(point_coord_r_zw_dest, point_coord_v_xxxy_src);
-      a_.OpElse();
-      // At centroid.
-      a_.OpEvalCentroid(point_coord_r_zw_dest, point_coord_v_xxxy_src);
-      a_.OpEndIf();
+      // Point sprite coordinates.
+      // Saturate to avoid negative point coordinates if the center of the pixel
+      // is not covered, and extrapolation is done.
+      a_.OpMov(dxbc::Dest::R(param_gen_temp, 0b1100),
+               dxbc::Src::V1D(uint32_t(InOutRegister::kPSInPointParameters),
+                              0b0100 << 4),
+               true);
+      // Primitive type.
+      {
+        uint32_t param_gen_primitive_type_temp = PushSystemTemp();
+        a_.OpUBFE(dxbc::Dest::R(param_gen_primitive_type_temp, 0b0011),
+                  dxbc::Src::LU(1),
+                  dxbc::Src::LU(kSysFlag_PrimitivePoint_Shift,
+                                kSysFlag_PrimitiveLine_Shift, 0, 0),
+                  LoadFlagsSystemConstant());
+        a_.OpBFI(dxbc::Dest::R(param_gen_temp, 0b0110), dxbc::Src::LU(1),
+                 dxbc::Src::LU(31),
+                 dxbc::Src::R(param_gen_primitive_type_temp, 0b0100 << 2),
+                 dxbc::Src::R(param_gen_temp));
+        // Release param_gen_primitive_type_temp.
+        PopSystemTemp();
+      }
       // TODO(Triang3l): Point / line primitive type flags to the sign bits.
       // Write ps_param_gen to the specified GPR.
       dxbc::Src param_gen_src(dxbc::Src::R(param_gen_temp));
@@ -792,7 +854,7 @@ void DxbcShaderTranslator::StartTranslation() {
     system_temp_position_ = PushSystemTemp(0b1111);
     system_temp_point_size_edge_flag_kill_vertex_ = PushSystemTemp(0b0100);
     // Set the point size to a negative value to tell the geometry shader that
-    // it should use the global point size if the vertex shader does not
+    // it should use the default point size if the vertex shader does not
     // override it.
     a_.OpMov(
         dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_, 0b0001),
@@ -1578,6 +1640,30 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result,
                            float((constant_1_mask >> 2) & 1),
                            float((constant_1_mask >> 3) & 1)));
   }
+
+  // Make the point size non-negative as negative is used to indicate that the
+  // default size must be used, and also clamp it to the bounds the way the R400
+  // (Adreno 200, to be more precise) hardware clamps it (functionally like a
+  // signed 32-bit integer, -NaN and -Infinity...-0 to the minimum, +NaN to the
+  // maximum).
+  if (result.storage_target ==
+          InstructionStorageTarget::kPointSizeEdgeFlagKillVertex &&
+      (used_write_mask & 0b0001)) {
+    a_.OpIMax(
+        dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_, 0b0001),
+        LoadSystemConstant(SystemConstants::Index::kPointVertexDiameterMin,
+                           offsetof(SystemConstants, point_vertex_diameter_min),
+                           dxbc::Src::kXXXX),
+        dxbc::Src::R(system_temp_point_size_edge_flag_kill_vertex_,
+                     dxbc::Src::kXXXX));
+    a_.OpIMin(
+        dxbc::Dest::R(system_temp_point_size_edge_flag_kill_vertex_, 0b0001),
+        LoadSystemConstant(SystemConstants::Index::kPointVertexDiameterMax,
+                           offsetof(SystemConstants, point_vertex_diameter_max),
+                           dxbc::Src::kXXXX),
+        dxbc::Src::R(system_temp_point_size_edge_flag_kill_vertex_,
+                     dxbc::Src::kXXXX));
+  }
 }
 
 void DxbcShaderTranslator::UpdateExecConditionalsAndEmitDisassembly(
@@ -1788,12 +1874,26 @@ void DxbcShaderTranslator::ProcessLoopStartInstruction(
                     2 + (instr.loop_constant_index >> 2))
           .Select(instr.loop_constant_index & 3));
 
-  // Push the count to the loop count stack - move XYZ to YZW and set X to this
-  // loop count.
-  a_.OpMov(dxbc::Dest::R(system_temp_loop_count_, 0b1110),
-           dxbc::Src::R(system_temp_loop_count_, 0b10010000));
-  a_.OpAnd(dxbc::Dest::R(system_temp_loop_count_, 0b0001), loop_constant_src,
-           dxbc::Src::LU(UINT8_MAX));
+  {
+    uint32_t loop_count_temp = PushSystemTemp();
+    a_.OpAnd(dxbc::Dest::R(loop_count_temp, 0b0001), loop_constant_src,
+             dxbc::Src::LU(UINT8_MAX));
+
+    // Skip the loop without pushing if the count is zero from the beginning.
+    a_.OpIf(false, dxbc::Src::R(loop_count_temp, dxbc::Src::kXXXX));
+    JumpToLabel(instr.loop_skip_address);
+    a_.OpEndIf();
+
+    // Push the count to the loop count stack - move XYZ to YZW and set X to the
+    // new loop count.
+    a_.OpMov(dxbc::Dest::R(system_temp_loop_count_, 0b1110),
+             dxbc::Src::R(system_temp_loop_count_, 0b10010000));
+    a_.OpMov(dxbc::Dest::R(system_temp_loop_count_, 0b0001),
+             dxbc::Src::R(loop_count_temp, dxbc::Src::kXXXX));
+
+    // Release loop_count_temp.
+    PopSystemTemp();
+  }
 
   // Push aL - keep the same value as in the previous loop if repeating, or the
   // new one otherwise.
@@ -1803,13 +1903,6 @@ void DxbcShaderTranslator::ProcessLoopStartInstruction(
     a_.OpUBFE(dxbc::Dest::R(system_temp_aL_, 0b0001), dxbc::Src::LU(8),
               dxbc::Src::LU(8), loop_constant_src);
   }
-
-  // Break if the loop counter is 0 (since the condition is checked in the end).
-  // TODO(Triang3l): Move this before pushing and address loading. This won't
-  // pop if the counter is 0.
-  a_.OpIf(false, dxbc::Src::R(system_temp_loop_count_, dxbc::Src::kXXXX));
-  JumpToLabel(instr.loop_skip_address);
-  a_.OpEndIf();
 }
 
 void DxbcShaderTranslator::ProcessLoopEndInstruction(
@@ -2007,14 +2100,16 @@ const DxbcShaderTranslator::SystemConstantRdef
          sizeof(float) * 4 * 6},
 
         {"xe_ndc_scale", ShaderRdefTypeIndex::kFloat3, sizeof(float) * 3},
-        {"xe_point_size_x", ShaderRdefTypeIndex::kFloat, sizeof(float)},
+        {"xe_point_vertex_diameter_min", ShaderRdefTypeIndex::kFloat,
+         sizeof(float)},
 
         {"xe_ndc_offset", ShaderRdefTypeIndex::kFloat3, sizeof(float) * 3},
-        {"xe_point_size_y", ShaderRdefTypeIndex::kFloat, sizeof(float)},
+        {"xe_point_vertex_diameter_max", ShaderRdefTypeIndex::kFloat,
+         sizeof(float)},
 
-        {"xe_point_size_min_max", ShaderRdefTypeIndex::kFloat2,
+        {"xe_point_constant_diameter", ShaderRdefTypeIndex::kFloat2,
          sizeof(float) * 2},
-        {"xe_point_screen_to_ndc", ShaderRdefTypeIndex::kFloat2,
+        {"xe_point_screen_diameter_to_ndc_radius", ShaderRdefTypeIndex::kFloat2,
          sizeof(float) * 2},
 
         {"xe_interpolator_sampling_pattern", ShaderRdefTypeIndex::kUint,
@@ -2394,7 +2489,7 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
     } else {
       for (uint32_t i = 0; i < uint32_t(sampler_bindings_.size()); ++i) {
         name_ptr += dxbc::AppendAlignedString(
-            shader_object_, sampler_bindings_[i].name.c_str());
+            shader_object_, sampler_bindings_[i].bindful_name.c_str());
       }
     }
   }
@@ -2422,8 +2517,8 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   } else {
     for (TextureBinding& texture_binding : texture_bindings_) {
       texture_binding.bindful_srv_rdef_name_ptr = name_ptr;
-      name_ptr += dxbc::AppendAlignedString(shader_object_,
-                                            texture_binding.name.c_str());
+      name_ptr += dxbc::AppendAlignedString(
+          shader_object_, texture_binding.bindful_name.c_str());
     }
   }
   uint32_t shared_memory_uav_name_ptr = name_ptr;
@@ -2461,8 +2556,8 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
         sampler.bind_point = uint32_t(i);
         sampler.bind_count = 1;
         sampler.id = uint32_t(i);
-        sampler_current_name_ptr +=
-            dxbc::GetAlignedStringLength(sampler_bindings_[i].name.c_str());
+        sampler_current_name_ptr += dxbc::GetAlignedStringLength(
+            sampler_bindings_[i].bindful_name.c_str());
       }
     }
   }
@@ -3464,7 +3559,7 @@ void DxbcShaderTranslator::WriteShaderCode() {
       if (register_count()) {
         // Unswapped vertex index input (only X component).
         ao_.OpDclInputSGV(
-            dxbc::Dest::V(uint32_t(InOutRegister::kVSInVertexIndex), 0b0001),
+            dxbc::Dest::V1D(uint32_t(InOutRegister::kVSInVertexIndex), 0b0001),
             dxbc::Name::kVertexID);
       }
     }
@@ -3502,14 +3597,14 @@ void DxbcShaderTranslator::WriteShaderCode() {
       for (uint32_t i = 0; i < interpolator_count; ++i) {
         ao_.OpDclInputPS(
             dxbc::InterpolationMode::kLinear,
-            dxbc::Dest::V(uint32_t(InOutRegister::kPSInInterpolators) + i));
+            dxbc::Dest::V1D(uint32_t(InOutRegister::kPSInInterpolators) + i));
       }
       if (register_count()) {
         // Point parameters input (only coordinates, not size, needed).
         ao_.OpDclInputPS(
             dxbc::InterpolationMode::kLinear,
-            dxbc::Dest::V(uint32_t(InOutRegister::kPSInPointParameters),
-                          0b0011));
+            dxbc::Dest::V1D(uint32_t(InOutRegister::kPSInPointParameters),
+                            0b0011));
       }
     }
     if (in_position_used_) {
@@ -3525,8 +3620,8 @@ void DxbcShaderTranslator::WriteShaderCode() {
           (is_writing_float24_depth && !shader_writes_depth)
               ? dxbc::InterpolationMode::kLinearNoPerspectiveSample
               : dxbc::InterpolationMode::kLinearNoPerspective,
-          dxbc::Dest::V(uint32_t(InOutRegister::kPSInPosition),
-                        in_position_used_),
+          dxbc::Dest::V1D(uint32_t(InOutRegister::kPSInPosition),
+                          in_position_used_),
           dxbc::Name::kPosition);
     }
     bool sample_rate_memexport =
@@ -3540,8 +3635,8 @@ void DxbcShaderTranslator::WriteShaderCode() {
     if (front_face_and_sample_index_mask) {
       // Is front face, sample index.
       ao_.OpDclInputPSSGV(
-          dxbc::Dest::V(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
-                        front_face_and_sample_index_mask),
+          dxbc::Dest::V1D(uint32_t(InOutRegister::kPSInFrontFaceAndSampleIndex),
+                          front_face_and_sample_index_mask),
           dxbc::Name::kIsFrontFace);
     }
     if (edram_rov_used_) {

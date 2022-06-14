@@ -130,6 +130,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_UserClipPlane5_Shift,
     kSysFlag_KillIfAnyVertexKilled_Shift,
     kSysFlag_PrimitivePolygonal_Shift,
+    kSysFlag_PrimitivePoint_Shift,
+    kSysFlag_PrimitiveLine_Shift,
     kSysFlag_DepthFloat24_Shift,
     kSysFlag_AlphaPassIfLess_Shift,
     kSysFlag_AlphaPassIfEqual_Shift,
@@ -173,6 +175,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_UserClipPlane5 = 1u << kSysFlag_UserClipPlane5_Shift,
     kSysFlag_KillIfAnyVertexKilled = 1u << kSysFlag_KillIfAnyVertexKilled_Shift,
     kSysFlag_PrimitivePolygonal = 1u << kSysFlag_PrimitivePolygonal_Shift,
+    kSysFlag_PrimitivePoint = 1u << kSysFlag_PrimitivePoint_Shift,
+    kSysFlag_PrimitiveLine = 1u << kSysFlag_PrimitiveLine_Shift,
     kSysFlag_DepthFloat24 = 1u << kSysFlag_DepthFloat24_Shift,
     kSysFlag_AlphaPassIfLess = 1u << kSysFlag_AlphaPassIfLess_Shift,
     kSysFlag_AlphaPassIfEqual = 1u << kSysFlag_AlphaPassIfEqual_Shift,
@@ -233,20 +237,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
     float user_clip_planes[6][4];
 
     float ndc_scale[3];
-    float point_size_x;
+    float point_vertex_diameter_min;
 
     float ndc_offset[3];
-    float point_size_y;
+    float point_vertex_diameter_max;
 
-    union {
-      struct {
-        float point_size_min;
-        float point_size_max;
-      };
-      float point_size_min_max[2];
-    };
-    // Screen point size * 2 (but not supersampled) -> size in NDC.
-    float point_screen_to_ndc[2];
+    float point_constant_diameter[2];
+    // Diameter in guest screen coordinates > radius (0.5 * diameter) in the NDC
+    // for the host viewport.
+    float point_screen_diameter_to_ndc_radius[2];
 
     uint32_t interpolator_sampling_pattern;
     uint32_t ps_param_gen;
@@ -353,13 +352,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kUserClipPlanes,
 
       kNDCScale,
-      kPointSizeX,
+      kPointVertexDiameterMin,
 
       kNDCOffset,
-      kPointSizeY,
+      kPointVertexDiameterMax,
 
-      kPointSizeMinMax,
-      kPointScreenToNDC,
+      kPointConstantDiameter,
+      kPointScreenDiameterToNDCRadius,
 
       kInterpolatorSamplingPattern,
       kPSParamGen,
@@ -430,7 +429,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // descriptor handling simplicity.
     xenos::FetchOpDimension dimension;
     bool is_signed;
-    std::string name;
+    std::string bindful_name;
   };
 
   // Arbitrary limit - there can't be more than 2048 in a shader-visible
@@ -451,7 +450,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     xenos::TextureFilter min_filter;
     xenos::TextureFilter mip_filter;
     xenos::AnisoFilter aniso_filter;
-    std::string name;
+    std::string bindful_name;
   };
 
   // Unordered access view bindings in space 0.
@@ -647,13 +646,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   bool IsDxbcVertexShader() const {
     return is_vertex_shader() &&
-           GetDxbcShaderModification().vertex.host_vertex_shader_type ==
-               Shader::HostVertexShaderType::kVertex;
+           !Shader::IsHostVertexShaderTypeDomain(
+               GetDxbcShaderModification().vertex.host_vertex_shader_type);
   }
   bool IsDxbcDomainShader() const {
     return is_vertex_shader() &&
-           GetDxbcShaderModification().vertex.host_vertex_shader_type !=
-               Shader::HostVertexShaderType::kVertex;
+           Shader::IsHostVertexShaderTypeDomain(
+               GetDxbcShaderModification().vertex.host_vertex_shader_type);
   }
 
   // Whether to use switch-case rather than if (pc >= label) for control flow.
@@ -665,15 +664,23 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Frees the last allocated internal r# registers for later reuse.
   void PopSystemTemp(uint32_t count = 1);
 
-  // Converts one scalar to or from PWL gamma, using 1 temporary scalar.
-  // The target may be the same as any of the source, the piece temporary or the
-  // accumulator, but not two or three of these.
-  // The piece and the accumulator can't be the same as source or as each other.
-  void ConvertPWLGamma(bool to_gamma, int32_t source_temp,
-                       uint32_t source_temp_component, uint32_t target_temp,
-                       uint32_t target_temp_component, uint32_t piece_temp,
-                       uint32_t piece_temp_component, uint32_t accumulator_temp,
-                       uint32_t accumulator_temp_component);
+  // Converts one scalar from piecewise linear gamma to linear. The target may
+  // be the same as the source, the temporary variables must be different. If
+  // the source is not pre-saturated, saturation will be done internally.
+  void PWLGammaToLinear(uint32_t target_temp, uint32_t target_temp_component,
+                        uint32_t source_temp, uint32_t source_temp_component,
+                        bool source_pre_saturated, uint32_t temp1,
+                        uint32_t temp1_component, uint32_t temp2,
+                        uint32_t temp2_component);
+  // Converts one scalar, which must be saturated before calling this function,
+  // from linear to piecewise linear gamma. The target may be the same as either
+  // the source or as temp_or_target, but not as both (and temp_or_target may
+  // not be the same as the source). temp_non_target must be different.
+  void PreSaturatedLinearToPWLGamma(
+      uint32_t target_temp, uint32_t target_temp_component,
+      uint32_t source_temp, uint32_t source_temp_component,
+      uint32_t temp_or_target, uint32_t temp_or_target_component,
+      uint32_t temp_non_target, uint32_t temp_non_target_component);
 
   bool IsSampleRate() const {
     assert_true(is_pixel_shader());

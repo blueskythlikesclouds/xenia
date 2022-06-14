@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -743,18 +744,6 @@ void D3D12CommandProcessor::SetPrimitiveTopology(
   }
 }
 
-void D3D12CommandProcessor::NotifyShaderBindingsLayoutUIDsInvalidated() {
-  if (bindless_resources_used_) {
-    cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
-    cbuffer_binding_descriptor_indices_pixel_.up_to_date = false;
-  } else {
-    bindful_textures_written_vertex_ = false;
-    bindful_textures_written_pixel_ = false;
-    bindful_samplers_written_vertex_ = false;
-    bindful_samplers_written_pixel_ = false;
-  }
-}
-
 std::string D3D12CommandProcessor::GetWindowTitleText() const {
   std::ostringstream title;
   title << "Direct3D 12";
@@ -776,12 +765,12 @@ std::string D3D12CommandProcessor::GetWindowTitleText() const {
       default:
         break;
     }
-    uint32_t resolution_scale_x =
-        texture_cache_ ? texture_cache_->GetDrawResolutionScaleX() : 1;
-    uint32_t resolution_scale_y =
-        texture_cache_ ? texture_cache_->GetDrawResolutionScaleY() : 1;
-    if (resolution_scale_x > 1 || resolution_scale_y > 1) {
-      title << ' ' << resolution_scale_x << 'x' << resolution_scale_y;
+    uint32_t draw_resolution_scale_x =
+        texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
+    uint32_t draw_resolution_scale_y =
+        texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
+    if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
+      title << ' ' << draw_resolution_scale_x << 'x' << draw_resolution_scale_y;
     }
   }
   return title.str();
@@ -844,11 +833,35 @@ bool D3D12CommandProcessor::SetupContext() {
       cvars::d3d12_bindless &&
       provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
 
+  // Get the draw resolution scale for the render target cache and the texture
+  // cache.
+  uint32_t draw_resolution_scale_x, draw_resolution_scale_y;
+  bool draw_resolution_scale_not_clamped =
+      TextureCache::GetConfigDrawResolutionScale(draw_resolution_scale_x,
+                                                 draw_resolution_scale_y);
+  if (!D3D12TextureCache::ClampDrawResolutionScaleToMaxSupported(
+          draw_resolution_scale_x, draw_resolution_scale_y, provider)) {
+    draw_resolution_scale_not_clamped = false;
+  }
+  if (!draw_resolution_scale_not_clamped) {
+    XELOGW(
+        "The requested draw resolution scale is not supported by the device or "
+        "the emulator, reducing to {}x{}",
+        draw_resolution_scale_x, draw_resolution_scale_y);
+  }
+
+  shared_memory_ =
+      std::make_unique<D3D12SharedMemory>(*this, *memory_, trace_writer_);
+  if (!shared_memory_->Initialize()) {
+    XELOGE("Failed to initialize shared memory");
+    return false;
+  }
+
   // Initialize the render target cache before configuring binding - need to
   // know if using rasterizer-ordered views for the bindless root signature.
   render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
-      *register_file_, *memory_, trace_writer_, *this,
-      bindless_resources_used_);
+      *register_file_, *memory_, trace_writer_, draw_resolution_scale_x,
+      draw_resolution_scale_y, *this, bindless_resources_used_);
   if (!render_target_cache_->Initialize()) {
     XELOGE("Failed to initialize the render target cache");
     return false;
@@ -1126,13 +1139,6 @@ bool D3D12CommandProcessor::SetupContext() {
     }
   }
 
-  shared_memory_ =
-      std::make_unique<D3D12SharedMemory>(*this, *memory_, trace_writer_);
-  if (!shared_memory_->Initialize()) {
-    XELOGE("Failed to initialize shared memory");
-    return false;
-  }
-
   primitive_processor_ = std::make_unique<D3D12PrimitiveProcessor>(
       *register_file_, *memory_, trace_writer_, *shared_memory_, *this);
   if (!primitive_processor_->Initialize()) {
@@ -1140,11 +1146,10 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
-  texture_cache_ = std::make_unique<TextureCache>(
-      *this, *register_file_, *shared_memory_, bindless_resources_used_,
-      render_target_cache_->GetResolutionScaleX(),
-      render_target_cache_->GetResolutionScaleY());
-  if (!texture_cache_->Initialize()) {
+  texture_cache_ = D3D12TextureCache::Create(
+      *register_file_, *shared_memory_, draw_resolution_scale_x,
+      draw_resolution_scale_y, *this, bindless_resources_used_);
+  if (!texture_cache_) {
     XELOGE("Failed to initialize the texture cache");
     return false;
   }
@@ -1161,8 +1166,8 @@ bool D3D12CommandProcessor::SetupContext() {
       provider.GetHeapFlagCreateNotZeroed();
 
   // Create gamma ramp resources.
-  dirty_gamma_ramp_table_ = true;
-  dirty_gamma_ramp_pwl_ = true;
+  gamma_ramp_256_entry_table_up_to_date_ = false;
+  gamma_ramp_pwl_up_to_date_ = false;
   D3D12_RESOURCE_DESC gamma_ramp_buffer_desc;
   ui::d3d12::util::FillBufferResourceDesc(
       gamma_ramp_buffer_desc, (256 + 128 * 3) * 4, D3D12_RESOURCE_FLAG_NONE);
@@ -1598,13 +1603,11 @@ void D3D12CommandProcessor::ShutdownContext() {
   gamma_ramp_upload_buffer_.Reset();
   gamma_ramp_buffer_.Reset();
 
-  pipeline_cache_.reset();
-
   texture_cache_.reset();
 
-  primitive_processor_.reset();
+  pipeline_cache_.reset();
 
-  shared_memory_.reset();
+  primitive_processor_.reset();
 
   // Shut down binding - bindless descriptors may be owned by subsystems like
   // the texture cache.
@@ -1636,6 +1639,8 @@ void D3D12CommandProcessor::ShutdownContext() {
   constant_buffer_pool_.reset();
 
   render_target_cache_.reset();
+
+  shared_memory_.reset();
 
   deferred_command_list_.Reset();
   ui::d3d12::util::ReleaseAndNull(command_list_1_);
@@ -1699,13 +1704,15 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       texture_cache_->TextureFetchConstantWritten(
           (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
     }
-  } else if (index == XE_GPU_REG_DC_LUT_PWL_DATA) {
-    UpdateGammaRampValue(GammaRampType::kPWL, value);
-  } else if (index == XE_GPU_REG_DC_LUT_30_COLOR) {
-    UpdateGammaRampValue(GammaRampType::kTable, value);
-  } else if (index == XE_GPU_REG_DC_LUT_RW_MODE) {
-    gamma_ramp_rw_subindex_ = 0;
   }
+}
+
+void D3D12CommandProcessor::OnGammaRamp256EntryTableValueWritten() {
+  gamma_ramp_256_entry_table_up_to_date_ = false;
+}
+
+void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+  gamma_ramp_pwl_up_to_date_ = false;
 }
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
@@ -1738,12 +1745,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   }
   D3D12_RESOURCE_DESC swap_texture_desc = swap_texture_resource->GetDesc();
 
-  uint32_t resolution_scale_max =
-      std::max(texture_cache_->GetDrawResolutionScaleX(),
-               texture_cache_->GetDrawResolutionScaleY());
+  uint32_t draw_resolution_scale_max =
+      std::max(texture_cache_->draw_resolution_scale_x(),
+               texture_cache_->draw_resolution_scale_y());
   presenter->RefreshGuestOutput(
       uint32_t(swap_texture_desc.Width), uint32_t(swap_texture_desc.Height),
-      1280 * resolution_scale_max, 720 * resolution_scale_max,
+      1280 * draw_resolution_scale_max, 720 * draw_resolution_scale_max,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource,
        &swap_texture_desc](
           ui::Presenter::GuestOutputRefreshContext& context) -> bool {
@@ -1801,6 +1808,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         // This is according to D3D::InitializePresentationParameters from a
         // game executable, which initializes the 256-entry table gamma ramp for
         // 8_8_8_8 output and the PWL gamma ramp for 2_10_10_10.
+        // TODO(Triang3l): Choose between the table and PWL based on
+        // DC_LUTA_CONTROL, support both for all formats (and also different
+        // increments for PWL).
         bool use_pwl_gamma_ramp =
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
             frontbuffer_format ==
@@ -1811,20 +1821,43 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
         // multiple times per frame).
-        if (use_pwl_gamma_ramp ? dirty_gamma_ramp_pwl_
-                               : dirty_gamma_ramp_table_) {
+        if (!(use_pwl_gamma_ramp ? gamma_ramp_pwl_up_to_date_
+                                 : gamma_ramp_256_entry_table_up_to_date_)) {
           uint32_t gamma_ramp_offset_bytes = use_pwl_gamma_ramp ? 256 * 4 : 0;
           uint32_t gamma_ramp_upload_offset_bytes =
               uint32_t(frame_current_ % kQueueFrames) * ((256 + 128 * 3) * 4) +
               gamma_ramp_offset_bytes;
           uint32_t gamma_ramp_size_bytes =
               (use_pwl_gamma_ramp ? 128 * 3 : 256) * 4;
-          std::memcpy(gamma_ramp_upload_buffer_mapping_ +
-                          gamma_ramp_upload_offset_bytes,
-                      use_pwl_gamma_ramp
-                          ? static_cast<const void*>(gamma_ramp_.pwl)
-                          : static_cast<const void*>(gamma_ramp_.table),
-                      gamma_ramp_size_bytes);
+          if (std::endian::native != std::endian::little &&
+              use_pwl_gamma_ramp) {
+            // R16G16 is first R16, where the shader expects the base, and
+            // second G16, where the delta should be, but gamma_ramp_pwl_rgb()
+            // is an array of 32-bit DC_LUT_PWL_DATA registers - swap 16 bits in
+            // each 32.
+            auto gamma_ramp_pwl_upload_buffer =
+                reinterpret_cast<reg::DC_LUT_PWL_DATA*>(
+                    gamma_ramp_upload_buffer_mapping_ +
+                    gamma_ramp_upload_offset_bytes);
+            const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl = gamma_ramp_pwl_rgb();
+            for (size_t i = 0; i < 128 * 3; ++i) {
+              reg::DC_LUT_PWL_DATA& gamma_ramp_pwl_upload_buffer_entry =
+                  gamma_ramp_pwl_upload_buffer[i];
+              reg::DC_LUT_PWL_DATA gamma_ramp_pwl_entry = gamma_ramp_pwl[i];
+              gamma_ramp_pwl_upload_buffer_entry.base =
+                  gamma_ramp_pwl_entry.delta;
+              gamma_ramp_pwl_upload_buffer_entry.delta =
+                  gamma_ramp_pwl_entry.base;
+            }
+          } else {
+            std::memcpy(
+                gamma_ramp_upload_buffer_mapping_ +
+                    gamma_ramp_upload_offset_bytes,
+                use_pwl_gamma_ramp
+                    ? static_cast<const void*>(gamma_ramp_pwl_rgb())
+                    : static_cast<const void*>(gamma_ramp_256_entry_table()),
+                gamma_ramp_size_bytes);
+          }
           PushTransitionBarrier(gamma_ramp_buffer_.Get(),
                                 gamma_ramp_buffer_state_,
                                 D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1834,8 +1867,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
               gamma_ramp_buffer_.Get(), gamma_ramp_offset_bytes,
               gamma_ramp_upload_buffer_.Get(), gamma_ramp_upload_offset_bytes,
               gamma_ramp_size_bytes);
-          (use_pwl_gamma_ramp ? dirty_gamma_ramp_pwl_
-                              : dirty_gamma_ramp_table_) = false;
+          (use_pwl_gamma_ramp ? gamma_ramp_pwl_up_to_date_
+                              : gamma_ramp_256_entry_table_up_to_date_) = true;
         }
 
         // Destination, source, and if bindful, gamma ramp.
@@ -2204,13 +2237,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   }
 
   // Get dynamic rasterizer state.
-  uint32_t resolution_scale_x = texture_cache_->GetDrawResolutionScaleX();
-  uint32_t resolution_scale_y = texture_cache_->GetDrawResolutionScaleY();
+  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
   RenderTargetCache::DepthFloat24Conversion depth_float24_conversion =
       render_target_cache_->depth_float24_conversion();
   draw_util::ViewportInfo viewport_info;
   draw_util::GetHostViewportInfo(
-      regs, resolution_scale_x, resolution_scale_y, true,
+      regs, draw_resolution_scale_x, draw_resolution_scale_y, true,
       D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
       normalized_depth_control,
       host_render_targets_used &&
@@ -2222,10 +2255,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       viewport_info);
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
-  scissor.offset[0] *= resolution_scale_x;
-  scissor.offset[1] *= resolution_scale_y;
-  scissor.extent[0] *= resolution_scale_x;
-  scissor.extent[1] *= resolution_scale_y;
+  scissor.offset[0] *= draw_resolution_scale_x;
+  scissor.offset[1] *= draw_resolution_scale_y;
+  scissor.extent[0] *= draw_resolution_scale_x;
+  scissor.extent[1] *= draw_resolution_scale_y;
 
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal,
@@ -2589,6 +2622,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 }
 
 void D3D12CommandProcessor::InitializeTrace() {
+  CommandProcessor::InitializeTrace();
+
   if (!BeginSubmission(false)) {
     return;
   }
@@ -2740,9 +2775,11 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
 
   shared_memory_->CompletedSubmissionUpdated();
 
+  render_target_cache_->CompletedSubmissionUpdated();
+
   primitive_processor_->CompletedSubmissionUpdated();
 
-  render_target_cache_->CompletedSubmissionUpdated();
+  texture_cache_->CompletedSubmissionUpdated(submission_completed_);
 }
 
 bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
@@ -2821,11 +2858,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     }
     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
-    primitive_processor_->BeginSubmission();
-
     render_target_cache_->BeginSubmission();
 
-    texture_cache_->BeginSubmission();
+    primitive_processor_->BeginSubmission();
+
+    texture_cache_->BeginSubmission(submission_current_);
   }
 
   if (is_opening_frame) {
@@ -2994,18 +3031,14 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       }
       constant_buffer_pool_->ClearCache();
 
-      pipeline_cache_->ClearCache();
-
-      render_target_cache_->ClearCache();
-
       texture_cache_->ClearCache();
 
-      for (auto it : root_signatures_bindful_) {
-        it.second->Release();
-      }
-      root_signatures_bindful_.clear();
+      // Not clearing the root signatures as they're referenced by pipelines,
+      // which are not destroyed.
 
       primitive_processor_->ClearCache();
+
+      render_target_cache_->ClearCache();
 
       shared_memory_->ClearCache();
     }
@@ -3128,14 +3161,15 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   auto sq_context_misc = regs.Get<reg::SQ_CONTEXT_MISC>();
   auto sq_program_cntl = regs.Get<reg::SQ_PROGRAM_CNTL>();
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
   uint32_t vgt_indx_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
   uint32_t vgt_max_vtx_indx = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
   uint32_t vgt_min_vtx_indx = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
 
   bool edram_rov_used = render_target_cache_->GetPath() ==
                         RenderTargetCache::Path::kPixelShaderInterlock;
-  uint32_t resolution_scale_x = texture_cache_->GetDrawResolutionScaleX();
-  uint32_t resolution_scale_y = texture_cache_->GetDrawResolutionScaleY();
+  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
 
   // Get the color info register values for each render target. Also, for ROV,
   // exclude components that don't exist in the format from the write mask.
@@ -3211,6 +3245,12 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   // Whether the primitive is polygonal and SV_IsFrontFace matters.
   if (primitive_polygonal) {
     flags |= DxbcShaderTranslator::kSysFlag_PrimitivePolygonal;
+  }
+  // Primitive type.
+  if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList) {
+    flags |= DxbcShaderTranslator::kSysFlag_PrimitivePoint;
+  } else if (draw_util::IsPrimitiveLine(regs)) {
+    flags |= DxbcShaderTranslator::kSysFlag_PrimitiveLine;
   }
   // Primitive killing condition.
   if (pa_cl_clip_cntl.vtx_kill_or) {
@@ -3319,28 +3359,43 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   // Point size.
-  float point_size_x = float(pa_su_point_size.width) * 0.125f;
-  float point_size_y = float(pa_su_point_size.height) * 0.125f;
-  float point_size_min = float(pa_su_point_minmax.min_size) * 0.125f;
-  float point_size_max = float(pa_su_point_minmax.max_size) * 0.125f;
-  dirty |= system_constants_.point_size_x != point_size_x;
-  dirty |= system_constants_.point_size_y != point_size_y;
-  dirty |= system_constants_.point_size_min != point_size_min;
-  dirty |= system_constants_.point_size_max != point_size_max;
-  system_constants_.point_size_x = point_size_x;
-  system_constants_.point_size_y = point_size_y;
-  system_constants_.point_size_min = point_size_min;
-  system_constants_.point_size_max = point_size_max;
-  float point_screen_to_ndc_x =
-      (/* 0.5f * 2.0f * */ float(resolution_scale_x)) /
+  float point_vertex_diameter_min =
+      float(pa_su_point_minmax.min_size) * (2.0f / 16.0f);
+  float point_vertex_diameter_max =
+      float(pa_su_point_minmax.max_size) * (2.0f / 16.0f);
+  float point_constant_diameter_x =
+      float(pa_su_point_size.width) * (2.0f / 16.0f);
+  float point_constant_diameter_y =
+      float(pa_su_point_size.height) * (2.0f / 16.0f);
+  dirty |=
+      system_constants_.point_vertex_diameter_min != point_vertex_diameter_min;
+  dirty |=
+      system_constants_.point_vertex_diameter_max != point_vertex_diameter_max;
+  dirty |=
+      system_constants_.point_constant_diameter[0] != point_constant_diameter_x;
+  dirty |=
+      system_constants_.point_constant_diameter[1] != point_constant_diameter_y;
+  system_constants_.point_vertex_diameter_min = point_vertex_diameter_min;
+  system_constants_.point_vertex_diameter_max = point_vertex_diameter_max;
+  system_constants_.point_constant_diameter[0] = point_constant_diameter_x;
+  system_constants_.point_constant_diameter[1] = point_constant_diameter_y;
+  // 2 because 1 in the NDC is half of the viewport's axis, 0.5 for diameter to
+  // radius conversion to avoid multiplying the per-vertex diameter by an
+  // additional constant in the shader.
+  float point_screen_diameter_to_ndc_radius_x =
+      (/* 0.5f * 2.0f * */ float(draw_resolution_scale_x)) /
       std::max(viewport_info.xy_extent[0], uint32_t(1));
-  float point_screen_to_ndc_y =
-      (/* 0.5f * 2.0f * */ float(resolution_scale_y)) /
+  float point_screen_diameter_to_ndc_radius_y =
+      (/* 0.5f * 2.0f * */ float(draw_resolution_scale_y)) /
       std::max(viewport_info.xy_extent[1], uint32_t(1));
-  dirty |= system_constants_.point_screen_to_ndc[0] != point_screen_to_ndc_x;
-  dirty |= system_constants_.point_screen_to_ndc[1] != point_screen_to_ndc_y;
-  system_constants_.point_screen_to_ndc[0] = point_screen_to_ndc_x;
-  system_constants_.point_screen_to_ndc[1] = point_screen_to_ndc_y;
+  dirty |= system_constants_.point_screen_diameter_to_ndc_radius[0] !=
+           point_screen_diameter_to_ndc_radius_x;
+  dirty |= system_constants_.point_screen_diameter_to_ndc_radius[1] !=
+           point_screen_diameter_to_ndc_radius_y;
+  system_constants_.point_screen_diameter_to_ndc_radius[0] =
+      point_screen_diameter_to_ndc_radius_x;
+  system_constants_.point_screen_diameter_to_ndc_radius[1] =
+      point_screen_diameter_to_ndc_radius_y;
 
   // Interpolator sampling pattern, centroid or center.
   uint32_t interpolator_sampling_pattern =
@@ -3404,9 +3459,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   dirty |= system_constants_.alpha_to_mask != alpha_to_mask;
   system_constants_.alpha_to_mask = alpha_to_mask;
 
-  uint32_t edram_tile_dwords_scaled = xenos::kEdramTileWidthSamples *
-                                      xenos::kEdramTileHeightSamples *
-                                      (resolution_scale_x * resolution_scale_y);
+  uint32_t edram_tile_dwords_scaled =
+      xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples *
+      (draw_resolution_scale_x * draw_resolution_scale_y);
 
   // EDRAM pitch for ROV writing.
   if (edram_rov_used) {
@@ -3518,7 +3573,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     // background is more likely.
     float poly_offset_scale_factor =
         xenos::kPolygonOffsetScaleSubpixelUnit *
-        std::max(resolution_scale_x, resolution_scale_y);
+        std::max(draw_resolution_scale_x, draw_resolution_scale_y);
     poly_offset_front_scale *= poly_offset_scale_factor;
     poly_offset_back_scale *= poly_offset_scale_factor;
     dirty |= system_constants_.edram_poly_offset_front_scale !=
@@ -3826,7 +3881,7 @@ bool D3D12CommandProcessor::UpdateBindings(
     current_samplers_vertex_.resize(
         std::max(current_samplers_vertex_.size(), sampler_count_vertex));
     for (size_t i = 0; i < sampler_count_vertex; ++i) {
-      TextureCache::SamplerParameters parameters =
+      D3D12TextureCache::SamplerParameters parameters =
           texture_cache_->GetSamplerParameters(samplers_vertex[i]);
       if (current_samplers_vertex_[i] != parameters) {
         cbuffer_binding_descriptor_indices_vertex_.up_to_date = false;
@@ -3858,7 +3913,7 @@ bool D3D12CommandProcessor::UpdateBindings(
       current_samplers_pixel_.resize(std::max(current_samplers_pixel_.size(),
                                               size_t(sampler_count_pixel)));
       for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
-        TextureCache::SamplerParameters parameters =
+        D3D12TextureCache::SamplerParameters parameters =
             texture_cache_->GetSamplerParameters((*samplers_pixel)[i]);
         if (current_samplers_pixel_[i] != parameters) {
           current_samplers_pixel_[i] = parameters;
@@ -3965,7 +4020,7 @@ bool D3D12CommandProcessor::UpdateBindings(
               std::max(current_sampler_bindless_indices_vertex_.size(),
                        size_t(sampler_count_vertex)));
           for (uint32_t j = 0; j < sampler_count_vertex; ++j) {
-            TextureCache::SamplerParameters sampler_parameters =
+            D3D12TextureCache::SamplerParameters sampler_parameters =
                 current_samplers_vertex_[j];
             uint32_t sampler_index;
             auto it = texture_cache_bindless_sampler_map_.find(
@@ -3997,7 +4052,7 @@ bool D3D12CommandProcessor::UpdateBindings(
               std::max(current_sampler_bindless_indices_pixel_.size(),
                        size_t(sampler_count_pixel)));
           for (uint32_t j = 0; j < sampler_count_pixel; ++j) {
-            TextureCache::SamplerParameters sampler_parameters =
+            D3D12TextureCache::SamplerParameters sampler_parameters =
                 current_samplers_pixel_[j];
             uint32_t sampler_index;
             auto it = texture_cache_bindless_sampler_map_.find(
