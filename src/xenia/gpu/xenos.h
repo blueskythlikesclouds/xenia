@@ -336,8 +336,8 @@ float Float7e3To32(uint32_t f10);
 // Converts 24-bit unorm depth in the value (not clamping) to an IEEE-754 32-bit
 // floating-point number.
 // Converts an IEEE-754 32-bit floating-point number to Xenos floating-point
-// depth, rounding to the nearest even.
-uint32_t Float32To20e4(float f32);
+// depth, rounding to the nearest even or towards zero.
+uint32_t Float32To20e4(float f32, bool round_to_nearest_even);
 // Converts Xenos floating-point depth in bits 0:23 (not clamping) to an
 // IEEE-754 32-bit floating-point number.
 float Float20e4To32(uint32_t f24);
@@ -713,6 +713,16 @@ enum class ArbitraryFilter : uint32_t {
   k4x4Asym = 5,
   kUseFetchConst = 7,
 };
+
+// While instructions contain 6-bit register index fields (allowing literal
+// indices, or literal index offsets, depending on the addressing mode, of up to
+// 63), the maximum total register count for a vertex and a pixel shader
+// combined is 128, and the boundary between vertex and pixel shaders can be
+// moved via SQ_PROGRAM_CNTL::VS/PS_NUM_REG, according to the IPR2015-00325
+// specification (section 8 "Register file allocation").
+constexpr uint32_t kMaxShaderTempRegistersLog2 = 7;
+constexpr uint32_t kMaxShaderTempRegisters = UINT32_C(1)
+                                             << kMaxShaderTempRegistersLog2;
 
 // a2xx_sq_ps_vtx_mode
 enum class VertexShaderExportMode : uint32_t {

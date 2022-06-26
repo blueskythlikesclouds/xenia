@@ -532,8 +532,10 @@ void GetHostViewportInfo(const RegisterFile& regs,
       // interpolated Z instead if conversion can't be done exactly, without
       // modifying clipping bounds by adjusting Z in vertex shaders, as that
       // may cause polygons placed explicitly at Z = 0 or Z = W to be clipped.
-      z_min = xenos::Float20e4To32(xenos::Float32To20e4(z_min));
-      z_max = xenos::Float20e4To32(xenos::Float32To20e4(z_max));
+      // Rounding the bounds to the nearest even regardless of the depth
+      // rounding mode not to add even more error by truncating twice.
+      z_min = xenos::Float20e4To32(xenos::Float32To20e4(z_min, true));
+      z_max = xenos::Float20e4To32(xenos::Float32To20e4(z_max, true));
     }
     if (full_float24_in_0_to_1) {
       // Remap the full [0...2) float24 range to [0...1) support data round-trip
@@ -574,11 +576,11 @@ void GetScissor(const RegisterFile& regs, Scissor& scissor_out,
   // Screen scissor is not used by Direct3D 9 (always 0, 0 to 8192, 8192), but
   // still handled here for completeness.
   auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
-  tl_x = std::max(tl_x, pa_sc_screen_scissor_tl.tl_x);
-  tl_y = std::max(tl_y, pa_sc_screen_scissor_tl.tl_y);
+  tl_x = std::max(tl_x, int32_t(pa_sc_screen_scissor_tl.tl_x));
+  tl_y = std::max(tl_y, int32_t(pa_sc_screen_scissor_tl.tl_y));
   auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
-  br_x = std::min(br_x, pa_sc_screen_scissor_br.br_x);
-  br_y = std::min(br_y, pa_sc_screen_scissor_br.br_y);
+  br_x = std::min(br_x, int32_t(pa_sc_screen_scissor_br.br_x));
+  br_y = std::min(br_y, int32_t(pa_sc_screen_scissor_br.br_y));
   if (clamp_to_surface_pitch) {
     // Clamp the horizontal scissor to surface_pitch for safety, in case that's
     // not done by the guest for some reason (it's not when doing draws without
@@ -647,31 +649,6 @@ uint32_t GetNormalizedColorMask(const RegisterFile& regs,
     normalized_color_mask |= rt_write_mask << (4 * i);
   }
   return normalized_color_mask;
-}
-
-void GetEdramTileWidthDivideScaleAndUpperShift(
-    uint32_t draw_resolution_scale_x, uint32_t& divide_scale_out,
-    uint32_t& divide_upper_shift_out) {
-  static_assert(
-      TextureCache::kMaxDrawResolutionScaleAlongAxis <= 3,
-      "GetEdramTileWidthDivideScaleAndUpperShift provides values only for draw "
-      "resolution scaling factors of up to 3");
-  switch (draw_resolution_scale_x) {
-    case 1:
-      divide_scale_out = kDivideScale5;
-      divide_upper_shift_out = kDivideUpperShift5 + 4;
-      break;
-    case 2:
-      divide_scale_out = kDivideScale5;
-      divide_upper_shift_out = kDivideUpperShift5 + 5;
-      break;
-    case 3:
-      divide_scale_out = kDivideScale15;
-      divide_upper_shift_out = kDivideUpperShift15 + 4;
-      break;
-    default:
-      assert_unhandled_case(draw_resolution_scale_x);
-  }
 }
 
 xenos::CopySampleSelect SanitizeCopySampleSelect(
@@ -764,7 +741,8 @@ const ResolveCopyShaderInfo
 bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
                     TraceWriter& trace_writer, uint32_t draw_resolution_scale_x,
                     uint32_t draw_resolution_scale_y,
-                    bool fixed_16_truncated_to_minus_1_to_1,
+                    bool fixed_rg16_truncated_to_minus_1_to_1,
+                    bool fixed_rgba16_truncated_to_minus_1_to_1,
                     ResolveInfo& info_out) {
   auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
   info_out.rb_copy_control = rb_copy_control;
@@ -1093,8 +1071,9 @@ bool GetResolveInfo(const RegisterFile& regs, const Memory& memory,
     color_edram_info.format = uint32_t(color_info.color_format);
     color_edram_info.format_is_64bpp = is_64bpp;
     color_edram_info.duplicate_second_pixel = uint32_t(duplicate_second_pixel);
-    if (fixed_16_truncated_to_minus_1_to_1 &&
-        (color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
+    if ((fixed_rg16_truncated_to_minus_1_to_1 &&
+         color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16) ||
+        (fixed_rgba16_truncated_to_minus_1_to_1 &&
          color_info.color_format ==
              xenos::ColorRenderTargetFormat::k_16_16_16_16)) {
       // The texture expects 0x8001 = -32, 0x7FFF = 32, but the hack making

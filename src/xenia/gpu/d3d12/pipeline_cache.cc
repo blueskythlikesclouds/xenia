@@ -882,20 +882,14 @@ PipelineCache::GetCurrentPixelShaderModification(
       RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode =
         DxbcShaderTranslator::Modification::DepthStencilMode;
-    RenderTargetCache::DepthFloat24Conversion depth_float24_conversion =
-        render_target_cache_.depth_float24_conversion();
-    if ((depth_float24_conversion ==
-             RenderTargetCache::DepthFloat24Conversion::kOnOutputTruncating ||
-         depth_float24_conversion ==
-             RenderTargetCache::DepthFloat24Conversion::kOnOutputRounding) &&
+    if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
         normalized_depth_control.z_enable &&
         regs.Get<reg::RB_DEPTH_INFO>().depth_format ==
             xenos::DepthRenderTargetFormat::kD24FS8) {
       modification.pixel.depth_stencil_mode =
-          depth_float24_conversion ==
-                  RenderTargetCache::DepthFloat24Conversion::kOnOutputTruncating
-              ? DepthStencilMode::kFloat24Truncating
-              : DepthStencilMode::kFloat24Rounding;
+          render_target_cache_.depth_float24_round()
+              ? DepthStencilMode::kFloat24Rounding
+              : DepthStencilMode::kFloat24Truncating;
     } else {
       if (shader.implicit_early_z_write_allowed() &&
           (!shader.writes_color_target(0) ||
@@ -1441,16 +1435,8 @@ bool PipelineCache::GetCurrentStateDescription(
     float polygon_offset, polygon_offset_scale;
     draw_util::GetPreferredFacePolygonOffset(
         regs, primitive_polygonal, polygon_offset_scale, polygon_offset);
-    float polygon_offset_host_scale = draw_util::GetD3D10PolygonOffsetFactor(
-        regs.Get<reg::RB_DEPTH_INFO>().depth_format, true);
-    // Using ceil here just in case a game wants the offset but passes a value
-    // that is too small - it's better to apply more offset than to make depth
-    // fighting worse or to disable the offset completely (Direct3D 12 takes an
-    // integer value).
-    description_out.depth_bias =
-        int32_t(
-            std::ceil(std::abs(polygon_offset * polygon_offset_host_scale))) *
-        (polygon_offset < 0.0f ? -1 : 1);
+    description_out.depth_bias = draw_util::GetD3D10IntegerPolygonOffset(
+        regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
     description_out.depth_bias_slope_scaled =
         polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
   }
@@ -2917,20 +2903,16 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     state_desc.PS.pShaderBytecode = depth_only_pixel_shader_.data();
     state_desc.PS.BytecodeLength = depth_only_pixel_shader_.size();
   } else {
-    if ((description.depth_func != xenos::CompareFunction::kAlways ||
+    if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+        (description.depth_func != xenos::CompareFunction::kAlways ||
          description.depth_write) &&
         description.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
-      switch (render_target_cache_.depth_float24_conversion()) {
-        case RenderTargetCache::DepthFloat24Conversion::kOnOutputTruncating:
-          state_desc.PS.pShaderBytecode = shaders::float24_truncate_ps;
-          state_desc.PS.BytecodeLength = sizeof(shaders::float24_truncate_ps);
-          break;
-        case RenderTargetCache::DepthFloat24Conversion::kOnOutputRounding:
-          state_desc.PS.pShaderBytecode = shaders::float24_round_ps;
-          state_desc.PS.BytecodeLength = sizeof(shaders::float24_round_ps);
-          break;
-        default:
-          break;
+      if (render_target_cache_.depth_float24_round()) {
+        state_desc.PS.pShaderBytecode = shaders::float24_round_ps;
+        state_desc.PS.BytecodeLength = sizeof(shaders::float24_round_ps);
+      } else {
+        state_desc.PS.pShaderBytecode = shaders::float24_truncate_ps;
+        state_desc.PS.BytecodeLength = sizeof(shaders::float24_truncate_ps);
       }
     }
   }
